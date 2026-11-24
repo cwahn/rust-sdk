@@ -1,4 +1,4 @@
-//! Register application event sources and serve the Events catalog and polls.
+//! Register application event sources and serve the Events catalog, polls, and push streams.
 
 #[cfg(feature = "local")]
 use std::rc::Rc as Shared;
@@ -20,7 +20,7 @@ use tokio::sync::Notify;
 use uuid::Uuid;
 
 use super::{
-    EXTENSION, LIST, POLL,
+    EXTENSION, LIST, POLL, STREAM,
     wire::{
         Completion, DEFAULT_POLL_MS, DeliveryMode, EventDescriptor, EventOccurrence, EventsError,
         ListEventsResult, PollParams, PollResult,
@@ -34,6 +34,7 @@ use crate::{
 };
 
 mod emit;
+mod push;
 pub use emit::EmitHandle;
 use emit::{EmitPage, Ring};
 
@@ -206,13 +207,15 @@ pub enum Replacement {
     Breaking,
 }
 
-/// Bounded read requested from an application-owned replay source.
+/// Bounded read requested from an application-owned replay source. A live
+/// push read has a 10-second deadline; expiry is a recoverable stream error.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct CheckQuery {
     /// Position to resume strictly after; `None` means return an empty batch at the current head.
     pub cursor: Option<String>,
-    /// Earliest eligible event timestamp, when replay is age-limited.
+    /// Earliest eligible event timestamp, when replay is age-limited. Push
+    /// clears the floor once the initial replay has drained.
     pub age_floor: Option<DateTime<Utc>>,
     /// Maximum number of items to return.
     pub max_events: usize,
@@ -231,8 +234,9 @@ pub struct CheckedBatch {
     /// The SDK returns an empty truncated page at this position.
     pub start: Option<String>,
     /// Occurrences in order. A cursor on an item must resume strictly after
-    /// that item without skipping any later item. Poll strips item cursors
-    /// from the wire, but uses them to cut oversized batches safely.
+    /// that item without skipping any later item. Push uses these positions
+    /// for incremental progress. Poll omits them on the wire, but uses them
+    /// to cut oversized batches safely.
     pub events: Vec<EventOccurrence>,
     /// End of scan, not necessarily the position of the last event.
     pub end: String,
@@ -260,6 +264,12 @@ impl CheckedBatch {
 /// An omitted authorizer means allow-all. Authenticated deployments MUST
 /// supply [`Descriptor::authorize`] for every event type that needs a
 /// permission check. The SDK cannot detect application authentication.
+///
+/// Configure push only on routes that can flush delivery frames promptly.
+/// Omit [`DeliveryMode::Push`] on routes behind buffering intermediaries.
+/// When the runtime terminates a push subscription, it sends the termination
+/// notification and then a correlated final result if the stream is writable.
+/// Global service shutdown does not guarantee a final result.
 #[derive(Clone)]
 pub struct EventsServer(Shared<Registry>);
 
@@ -287,6 +297,7 @@ struct Entry {
     generation: u64,
     input_generation: u64,
     source: Source,
+    emitted: Option<Shared<Notify>>,
 }
 
 enum Source {
@@ -366,6 +377,8 @@ impl EventsServer {
 
     /// Register a bounded check that owns its cursor format and age seeking.
     /// A null request cursor must return an empty batch at the current head.
+    /// A live push check that takes longer than 10 seconds is dropped and
+    /// reported as a recoverable error; delivery retries from the same cursor.
     /// Descriptors with match or transform hooks must use [`Self::register_emit`].
     /// Omitting [`Descriptor::authorize`] means allow-all; install it wherever
     /// authenticated permissions need checking.
@@ -398,6 +411,9 @@ impl EventsServer {
             return Err(limit("eventTypes", MAX_SOURCES));
         }
         let generation = state.revision + 1;
+        let emitted = (matches!(&source, Source::Emit(_))
+            && descriptor.wire.delivery.contains(&DeliveryMode::Push))
+        .then(|| Shared::new(Notify::new()));
         state.entries.insert(
             descriptor.wire.name.clone(),
             Entry {
@@ -406,6 +422,7 @@ impl EventsServer {
                 generation,
                 input_generation: generation,
                 source,
+                emitted,
             },
         );
         self.0.changed(&mut state);
@@ -432,6 +449,13 @@ impl EventsServer {
             if let Source::Emit(ring) = &mut entry.source {
                 *ring = Ring::default();
             }
+        }
+        if descriptor.wire.delivery.contains(&DeliveryMode::Push)
+            && matches!(&entry.source, Source::Emit(_))
+        {
+            entry
+                .emitted
+                .get_or_insert_with(|| Shared::new(Notify::new()));
         }
         let previous = std::mem::replace(&mut entry.descriptor, Shared::new(descriptor));
         self.0.changed(&mut state);
@@ -508,7 +532,8 @@ impl EventsServer {
             .take(PAGE_SIZE)
             .map(|entry| {
                 let mut wire = entry.descriptor.wire.clone();
-                wire.delivery.retain(|mode| *mode == DeliveryMode::Poll);
+                wire.delivery
+                    .retain(|mode| matches!(mode, DeliveryMode::Poll | DeliveryMode::Push));
                 wire
             })
             .collect();
@@ -560,12 +585,18 @@ impl EventsServer {
                 .map(|(descriptor, _, _)| descriptor.wire.input_schema.as_ref()),
         )?;
         let (descriptor, registration, generation) = registered.ok_or_else(not_found)?;
+        if method == STREAM {
+            let params =
+                serde_json::from_value(raw).map_err(|_| invalid("invalid stream parameters"))?;
+            return self
+                .stream(params, context, descriptor, registration, generation)
+                .await;
+        }
         if method != POLL {
-            return Err(unsupported(if method == "events/stream" {
-                "push"
-            } else {
-                "webhook"
-            }));
+            return Err(unsupported("webhook"));
+        }
+        if !descriptor.wire.delivery.contains(&DeliveryMode::Poll) {
+            return Err(unsupported("poll"));
         }
         let params = serde_json::from_value(raw).map_err(|_| invalid("invalid poll parameters"))?;
         encode(
@@ -589,13 +620,7 @@ impl EventsServer {
         if max_events == 0 {
             return Err(invalid("maxEvents must be positive"));
         }
-        let floor = params
-            .cursor
-            .as_ref()
-            .and(params.max_age_ms)
-            .and_then(|age| i64::try_from(age).ok())
-            .and_then(chrono::TimeDelta::try_milliseconds)
-            .and_then(|age| Utc::now().checked_sub_signed(age));
+        let floor = age_floor(params.cursor.as_deref(), params.max_age_ms);
         let args = params.arguments.unwrap_or_default();
         (descriptor.validate_arguments)(&args)?;
         if let Some(authorize) = &descriptor.authorize {
@@ -634,7 +659,7 @@ impl EventsServer {
         }
         let check = match read {
             Read::Check(check) => check,
-            Read::Emit(page) => return page.finish(&context, &args, &current),
+            Read::Emit(page) => return page.finish(&context, &args, &current, false),
         };
         let batch = tokio::select! {
             biased;
@@ -647,7 +672,7 @@ impl EventsServer {
             ensure_current(entry, registration, generation)?;
             entry.descriptor.clone()
         };
-        checked_result(batch, &query, &params.name, &current)
+        checked_result(batch, &query, &params.name, &current, false)
     }
 }
 
@@ -670,11 +695,16 @@ fn validate_descriptor(descriptor: &Descriptor) -> Result<(), EventsError> {
             return Err(invalid("duplicate delivery mode"));
         }
     }
-    if !descriptor.wire.delivery.contains(&DeliveryMode::Poll) {
+    if !descriptor
+        .wire
+        .delivery
+        .iter()
+        .any(|mode| matches!(mode, DeliveryMode::Poll | DeliveryMode::Push))
+    {
         return Err(EventsError::Unsupported {
             feature: "deliveryMode".into(),
             value: Some(json!(descriptor.wire.delivery)),
-            reason: Some("this source requires poll delivery".into()),
+            reason: Some("this source requires poll or push delivery".into()),
         });
     }
     crate::transport::common::mcp_headers::validate_param_header_annotations(
@@ -691,6 +721,14 @@ fn encode(result: impl Serialize) -> Result<CustomResult, EventsError> {
 
 fn source_error(message: &'static str) -> EventsError {
     EventsError::Remote(Box::new(crate::ErrorData::internal_error(message, None)))
+}
+
+fn age_floor(cursor: Option<&str>, max_age_ms: Option<u64>) -> Option<DateTime<Utc>> {
+    cursor
+        .and(max_age_ms)
+        .and_then(|age| i64::try_from(age).ok())
+        .and_then(chrono::TimeDelta::try_milliseconds)
+        .and_then(|age| Utc::now().checked_sub_signed(age))
 }
 
 // None means the occurrence cannot fit the poll byte budget.
@@ -728,6 +766,7 @@ fn checked_result(
     query: &CheckQuery,
     name: &str,
     descriptor: &Descriptor,
+    item_cursors: bool,
 ) -> Result<PollResult, EventsError> {
     let invalid_batch = || source_error("event check violated its replay contract");
     let next = batch.next_poll_ms.unwrap_or(DEFAULT_POLL_MS);
@@ -754,7 +793,8 @@ fn checked_result(
     let mut bytes = 0;
     let mut cut = None;
     let mut overflow = false;
-    for mut event in batch.events {
+    let count = batch.events.len();
+    for (index, mut event) in batch.events.into_iter().enumerate() {
         if event.event_id.is_empty()
             || event.name != name
             || query.age_floor.is_some_and(|floor| event.timestamp < floor)
@@ -762,10 +802,11 @@ fn checked_result(
             return Err(invalid_batch());
         }
         let position = event.cursor.take();
-        if position
-            .as_ref()
-            .is_some_and(|position| position.is_empty() || position == start)
-        {
+        if position.as_ref().is_some_and(|position| {
+            position.is_empty()
+                || position == start
+                || (index + 1 < count && position == &batch.end)
+        }) {
             return Err(invalid_batch());
         }
         if batch.start.is_some() || overflow {
@@ -777,10 +818,13 @@ fn checked_result(
             continue;
         };
         bytes += size;
-        events.push(event);
         if let Some(position) = position {
-            cut = Some((events.len(), position));
+            if item_cursors {
+                event.cursor = Some(position.clone());
+            }
+            cut = Some((events.len() + 1, position));
         }
+        events.push(event);
     }
     if let Some(start) = batch.start {
         let more = batch.has_more || start != batch.end;
@@ -853,7 +897,7 @@ mod tests {
                 ..empty.clone()
             },
         ] {
-            assert!(checked_result(batch, &query, "sample", &descriptor).is_err());
+            assert!(checked_result(batch, &query, "sample", &descriptor, false).is_err());
         }
         query.cursor = Some("start".into());
         query.age_floor = Some(now);
@@ -913,7 +957,7 @@ mod tests {
                 ..empty.clone()
             },
         ] {
-            assert!(checked_result(batch, &query, "sample", &descriptor).is_err());
+            assert!(checked_result(batch, &query, "sample", &descriptor, false).is_err());
         }
     }
 
@@ -928,10 +972,30 @@ mod tests {
         let mut batch = CheckedBatch::new("end");
         batch.start = Some("gap".into());
         batch.events.push(event("sample", "id", Utc::now()));
-        let result = checked_result(batch, &query, "sample", &contract()).unwrap();
+        let result = checked_result(batch, &query, "sample", &contract(), false).unwrap();
         assert!(result.truncated && result.has_more);
         assert!(result.events.is_empty());
         assert_eq!(result.cursor.as_deref(), Some("gap"));
+    }
+
+    #[test]
+    fn rejects_batch_end_on_an_intermediate_occurrence_in_both_modes() {
+        let now = Utc::now();
+        let query = CheckQuery {
+            cursor: Some("start".into()),
+            age_floor: None,
+            max_events: 2,
+            max_bytes: MAX_BATCH_BYTES,
+        };
+        let mut first = event("sample", "first", now);
+        first.cursor = Some("end".into());
+        let mut batch = CheckedBatch::new("end");
+        batch.events.extend([first, event("sample", "second", now)]);
+        for item_cursors in [false, true] {
+            assert!(
+                checked_result(batch.clone(), &query, "sample", &contract(), item_cursors).is_err()
+            );
+        }
     }
 
     #[test]

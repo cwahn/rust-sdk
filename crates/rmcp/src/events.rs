@@ -29,8 +29,9 @@
 //! # fn main() {}
 //! ```
 //!
-//! On the client, use discovery startup and call `EventsClient::list_page`
-//! and `EventsClient::poll`. Persist only the cursor of a consumed page.
+//! On the client, use discovery startup and call `EventsClient::list_page`,
+//! `EventsClient::poll`, or `EventsClient::subscribe`. Persist checkpoints
+//! only after processing the occurrences they cover.
 //! Poll result payloads still appear in DEBUG response logs because `CustomResult` carries no method name.
 
 #[cfg(feature = "client")]
@@ -38,6 +39,21 @@ pub mod client;
 #[cfg(feature = "server")]
 pub mod server;
 pub mod wire;
+
+#[cfg(any(feature = "server", feature = "client"))]
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StreamParams {
+    name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    arguments: Option<crate::model::JsonObject>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cursor: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_age_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    heartbeat_ms: Option<u64>,
+}
 
 pub(crate) const EXTENSION: &str = "io.modelcontextprotocol/events";
 #[cfg(any(feature = "server", feature = "client"))]
@@ -57,6 +73,18 @@ pub(crate) fn advertises_list_changes(capabilities: &crate::model::ServerCapabil
 const LIST: &str = "events/list";
 #[cfg(any(feature = "server", feature = "client"))]
 const POLL: &str = "events/poll";
+#[cfg(any(feature = "server", feature = "client"))]
+pub(crate) const STREAM: &str = "events/stream";
+#[cfg(any(feature = "server", feature = "client"))]
+const ACTIVE: &str = "notifications/events/active";
+#[cfg(any(feature = "server", feature = "client"))]
+const EVENT: &str = "notifications/events/event";
+#[cfg(any(feature = "server", feature = "client"))]
+const HEARTBEAT: &str = "notifications/events/heartbeat";
+#[cfg(any(feature = "server", feature = "client"))]
+const ERROR: &str = "notifications/events/error";
+#[cfg(any(feature = "server", feature = "client"))]
+const TERMINATED: &str = "notifications/events/terminated";
 
 #[cfg(any(
     feature = "server",
@@ -65,7 +93,7 @@ const POLL: &str = "events/poll";
 pub(crate) fn named_method(method: &str) -> bool {
     matches!(
         method,
-        POLL | "events/stream" | "events/subscribe" | "events/unsubscribe"
+        POLL | STREAM | "events/subscribe" | "events/unsubscribe"
     )
 }
 

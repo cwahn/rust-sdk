@@ -94,7 +94,11 @@ impl EmitHandle {
             let Source::Emit(ring) = &mut entry.source else {
                 return Err(not_found());
             };
-            return ring.append(event, bytes);
+            ring.append(event, bytes)?;
+            if let Some(emitted) = &entry.emitted {
+                emitted.notify_waiters();
+            }
+            return Ok(());
         }
     }
 }
@@ -238,6 +242,7 @@ impl EmitPage {
         context: &EventContext,
         args: &JsonObject,
         descriptor: &Descriptor,
+        item_cursors: bool,
     ) -> Result<PollResult, EventsError> {
         let Self {
             scope,
@@ -269,6 +274,9 @@ impl EmitPage {
             }
             bytes += size;
             position = next;
+            if item_cursors {
+                event.cursor = Some(format!("{scope}{position}"));
+            }
             events.push(event);
         }
         Ok(poll_result(

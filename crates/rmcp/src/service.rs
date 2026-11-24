@@ -2173,6 +2173,142 @@ mod outbound_backpressure_tests {
     }
 }
 
+#[cfg(all(test, feature = "events", feature = "client", feature = "server"))]
+mod events_backpressure_tests {
+    use futures::StreamExt;
+
+    use super::*;
+    use crate::{
+        ClientLifecycleMode, ClientServiceExt, ServerHandler,
+        events::{
+            client::{EventSubscription, EventUpdate, EventsClient},
+            server::{CheckedBatch, Descriptor, EventsServer},
+            wire::{DeliveryMode, EventsError},
+        },
+        model::{ClientConfig, JsonObject},
+    };
+
+    struct App(EventsServer);
+
+    impl ServerHandler for App {
+        fn events(&self) -> Option<&EventsServer> {
+            Some(&self.0)
+        }
+    }
+
+    async fn subscribe(
+        runtime: EventsServer,
+        cursor: Option<String>,
+    ) -> (
+        RunningService<RoleClient, ClientConfig>,
+        EventSubscription,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (server_io, client_io) = tokio::io::duplex(4096);
+        let server = tokio::task::spawn_local(async move {
+            App(runtime)
+                .serve(server_io)
+                .await
+                .unwrap()
+                .waiting()
+                .await
+                .unwrap();
+        });
+        let client = ClientConfig::default()
+            .serve_with_lifecycle(
+                client_io,
+                ClientLifecycleMode::Discover {
+                    preferred_versions: vec![ProtocolVersion::V_2026_07_28],
+                },
+            )
+            .await
+            .unwrap();
+        let api = EventsClient::new(client.peer().clone());
+        let options = crate::events::client::SubscriptionOptions {
+            cursor,
+            ..Default::default()
+        };
+        let subscription = api.subscribe("source", None, options).await.unwrap();
+        (client, subscription, server)
+    }
+
+    fn source() -> Descriptor {
+        Descriptor::typed::<JsonObject, JsonObject>("source", "", [DeliveryMode::Push])
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn events_activation_deadline_while_outbound_capacity_is_reserved_leaves_no_route() {
+        tokio::task::LocalSet::new().run_until(async {
+            let runtime = EventsServer::new();
+            runtime.register_check(source(), |_, _, _| async {
+                panic!("queue was saturated before the push request opened");
+            }).unwrap();
+            let (client, mut subscription, server) = subscribe(runtime, None).await;
+            let reserved = client.tx.reserve_many(client.tx.max_capacity()).await.unwrap();
+            let start = tokio::time::Instant::now();
+            assert!(matches!(subscription.next().await,
+                Some(EventUpdate::RecoverableError(EventsError::Service(error)))
+                if matches!(*error, ServiceError::Timeout { timeout } if timeout == Duration::from_secs(15))));
+            assert_eq!(start.elapsed(), Duration::from_secs(15));
+            assert!(client.subscription_channels_read().is_empty());
+            // The open never obtained a permit, so there is no stream to cancel.
+            drop(subscription);
+            drop(reserved);
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                EventsClient::new(client.peer().clone()).list_page(None),
+            )
+            .await
+            .expect("the queue did not resume after capacity was released")
+            .unwrap();
+            client.cancel().await.unwrap();
+            server.await.unwrap();
+        }).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dropping_events_stream_while_outbound_capacity_is_reserved_cancels_the_source() {
+        tokio::task::LocalSet::new().run_until(async {
+            let runtime = EventsServer::new();
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let dropped = CancellationToken::new();
+            runtime.register_check(source(), {
+                let entered = entered.clone();
+                let dropped = dropped.clone();
+                move |_, _, query| {
+                    let entered = entered.clone();
+                    let dropped = dropped.clone();
+                    async move {
+                        if query.cursor.as_deref() == Some("seed") {
+                            let mut page = CheckedBatch::new("head");
+                            page.has_more = true;
+                            return Ok(page);
+                        }
+                        let _drop_guard = dropped.drop_guard();
+                        entered.notify_one();
+                        std::future::pending().await
+                    }
+                }
+            }).unwrap();
+            let (client, mut subscription, server) = subscribe(runtime, Some("seed".into())).await;
+            assert!(matches!(subscription.next().await, Some(EventUpdate::Checkpoint(cursor)) if cursor == "head"));
+            entered.notified().await;
+            let reserved = client.tx.reserve_many(client.tx.max_capacity()).await.unwrap();
+            assert!(!dropped.is_cancelled());
+            drop(subscription);
+            assert!(client.subscription_channels_read().is_empty());
+            // The inline drain must wait for ordinary outbound capacity.
+            tokio::task::yield_now().await;
+            assert!(!dropped.is_cancelled());
+            drop(reserved);
+            tokio::time::timeout(Duration::from_secs(5), dropped.cancelled()).await
+                .expect("dropping the backpressured subscription must cancel the in-flight source");
+            client.cancel().await.unwrap();
+            server.await.unwrap();
+        }).await;
+    }
+}
+
 #[cfg(all(test, feature = "server"))]
 mod sep2260_marker_tests {
     use std::sync::Arc;

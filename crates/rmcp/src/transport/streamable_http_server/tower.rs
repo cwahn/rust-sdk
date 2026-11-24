@@ -1686,6 +1686,7 @@ where
         receiver: tokio::sync::mpsc::Receiver<ServerJsonRpcMessage>,
         request_ct: CancellationToken,
         long_lived: bool,
+        keep_alive: Option<Duration>,
     ) -> BoxResponse {
         // Long-lived requests are bound to this connection. Do not prime or
         // store their SSE frames, and cancel them when the response is dropped.
@@ -1693,7 +1694,7 @@ where
             let stream = self.persisted_stateless_stream(first, receiver, request_ct, event_store);
             sse_stream_response(
                 stream,
-                self.config.sse_keep_alive,
+                keep_alive,
                 self.config.cancellation_token.child_token(),
             )
         } else {
@@ -1705,7 +1706,7 @@ where
                 });
             sse_stream_response(
                 CancelOnDisconnect::new(stream, request_ct),
-                self.config.sse_keep_alive,
+                keep_alive,
                 self.config.cancellation_token.child_token(),
             )
         }
@@ -1718,7 +1719,12 @@ where
         mut request: crate::model::JsonRpcRequest<ClientRequest>,
         parts: http::request::Parts,
     ) -> HttpResult<BoxResponse> {
-        let long_lived = is_long_lived_request(request.request.method());
+        let method = request.request.method();
+        #[cfg(feature = "events")]
+        let sdk_events_stream = method == crate::events::STREAM && service.events().is_some();
+        #[cfg(not(feature = "events"))]
+        let sdk_events_stream = false;
+        let long_lived = is_long_lived_request(method) || sdk_events_stream;
         let request_meta_malformed = !request
             .request
             .get_meta()
@@ -1769,7 +1775,11 @@ where
             ServerJsonRpcMessage::Response(_) | ServerJsonRpcMessage::Error(_)
         );
         let status = jsonrpc_http_status(&first, request_meta_malformed);
-        if terminal && (self.config.json_response || status != http::StatusCode::OK) {
+        if terminal
+            && (self.config.json_response
+                || status != http::StatusCode::OK
+                || (sdk_events_stream && matches!(&first, ServerJsonRpcMessage::Error(_))))
+        {
             // This message is the whole reply, so `receiver` is dropped here and
             // anything the handler emits afterwards is undeliverable. Cancel it so
             // a still-running handler stops instead of running on unobserved: its
@@ -1780,7 +1790,12 @@ where
             return jsonrpc_message_response(first, status);
         }
 
-        Ok(self.stateless_sse_response(Some(first), receiver, request_ct, long_lived))
+        let keep_alive = if sdk_events_stream {
+            None
+        } else {
+            self.config.sse_keep_alive
+        };
+        Ok(self.stateless_sse_response(Some(first), receiver, request_ct, long_lived, keep_alive))
     }
 
     /// Looks up `name`'s input schema for SEP-2243 `Mcp-Param-*` validation.
@@ -2539,10 +2554,17 @@ where
                                 receiver,
                                 request_ct,
                                 false,
+                                self.config.sse_keep_alive,
                             ))
                         }
                     } else {
-                        Ok(self.stateless_sse_response(None, receiver, request_ct, false))
+                        Ok(self.stateless_sse_response(
+                            None,
+                            receiver,
+                            request_ct,
+                            false,
+                            self.config.sse_keep_alive,
+                        ))
                     }
                 }
                 ClientJsonRpcMessage::Notification(_notification) => {

@@ -153,7 +153,7 @@ elicitation = ["dep:url"]
 # SEP-2322 requestState integrity helper (HMAC-SHA256 seal/open codec)
 request-state = ["dep:hmac", "dep:zeroize", "base64"]
 skills-fs = ["server", "base64", "dep:cap-std", "dep:cap-fs-ext", "dep:yaml_serde", "dep:windows-sys"]
-# MCP Events Beta catalog and polling; role and transport features stay independent.
+# MCP Events Beta catalog, polling, and push; role and transport features stay independent.
 events = []
 
 # reqwest http client
