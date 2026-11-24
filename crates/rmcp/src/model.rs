@@ -1148,8 +1148,7 @@ pub type CancelledNotification =
 ///
 /// This preserves the raw `method` name and `params` payload so handlers can
 /// deserialize them into domain-specific types.
-#[derive(Clone)]
-#[cfg_attr(not(feature = "events"), derive(Debug))]
+#[derive(Clone, Debug)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[expect(clippy::exhaustive_structs, reason = "intentionally exhaustive")]
 pub struct CustomNotification {
@@ -1186,7 +1185,7 @@ impl CustomNotification {
 /// This preserves the raw `method` name and `params` payload so handlers can
 /// deserialize them into domain-specific types.
 #[derive(Clone)]
-#[cfg_attr(not(feature = "events"), derive(Debug))]
+#[cfg_attr(not(feature = "events-webhook-receiver"), derive(Debug))]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[expect(clippy::exhaustive_structs, reason = "intentionally exhaustive")]
 pub struct CustomRequest {
@@ -1200,50 +1199,21 @@ pub struct CustomRequest {
     pub extensions: Extensions,
 }
 
-#[cfg(feature = "events")]
-macro_rules! custom_events_debug {
-    ($ty:ident) => {
-        impl std::fmt::Debug for $ty {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                let mut debug = f.debug_struct(stringify!($ty));
-                debug.field("method", &self.method);
-                if self.method.starts_with("events/")
-                    || self.method.starts_with("notifications/events/")
-                {
-                    debug.field("params", &"<redacted>").finish_non_exhaustive()
-                } else {
-                    debug
-                        .field("params", &self.params)
-                        .field("extensions", &self.extensions)
-                        .finish()
-                }
-            }
-        }
-    };
-}
-
-#[cfg(feature = "events")]
+#[cfg(feature = "events-webhook-receiver")]
 impl std::fmt::Debug for CustomRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut debug = f.debug_struct("CustomRequest");
         debug.field("method", &self.method);
         // A raw JSON-RPC subscribe still carries the signing key in params.
-        #[cfg(feature = "events-webhook-receiver")]
         if self.method == "events/subscribe" {
             return debug.field("params", &"<redacted>").finish_non_exhaustive();
         }
-        if self.method.starts_with("events/") || self.method.starts_with("notifications/events/") {
-            debug.field("params", &"<redacted>").finish_non_exhaustive()
-        } else {
-            debug
-                .field("params", &self.params)
-                .field("extensions", &self.extensions)
-                .finish()
-        }
+        debug
+            .field("params", &self.params)
+            .field("extensions", &self.extensions)
+            .finish()
     }
 }
-#[cfg(feature = "events")]
-custom_events_debug!(CustomNotification);
 
 impl CustomRequest {
     pub fn new(method: impl Into<String>, params: Option<Value>) -> Self {

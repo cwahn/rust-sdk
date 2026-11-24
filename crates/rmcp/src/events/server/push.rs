@@ -2,22 +2,20 @@ use std::{pin::pin, time::Duration};
 
 use tokio::time::{Instant, sleep_until, timeout};
 
-use super::*;
+use super::{super::wire::terminal, *};
 use crate::{
     events::{ACTIVE, ERROR, EVENT, HEARTBEAT, StreamParams, TERMINATED},
     model::{CustomNotification, GetMeta, ServerNotification, SubscriptionsListenResult},
 };
 
 const ACTIVATION_BUDGET: Duration = Duration::from_secs(10);
-const LIVE_READ_BUDGET: Duration = Duration::from_secs(10);
-const AUTHORIZE_BUDGET: Duration = Duration::from_secs(10);
 const MIN_HEARTBEAT_MS: u64 = 1_000;
 const MAX_HEARTBEAT_MS: u64 = 30_000;
 const AUTHORIZE_INTERVAL: Duration = Duration::from_secs(30);
 
 struct Push<'a> {
     server: &'a EventsServer,
-    context: EventContext,
+    context: RequestContext<RoleServer>,
     name: String,
     args: JsonObject,
     registration: u64,
@@ -37,13 +35,13 @@ impl EventsServer {
     pub(super) async fn stream(
         &self,
         params: StreamParams,
-        context: EventContext,
+        context: RequestContext<RoleServer>,
         descriptor: Shared<Descriptor>,
         registration: u64,
         generation: u64,
     ) -> Result<CustomResult, EventsError> {
         if !descriptor.wire.delivery.contains(&DeliveryMode::Push) {
-            return Err(unsupported("push"));
+            return Err(unsupported(DeliveryMode::Push));
         }
         let mut push = Push {
             server: self,
@@ -64,12 +62,7 @@ impl EventsServer {
                 .clamp(MIN_HEARTBEAT_MS, MAX_HEARTBEAT_MS),
             last_frame: Instant::now(),
         };
-        let ct = push.context.ct.clone();
-        tokio::select! {
-            biased;
-            _ = ct.cancelled() => Err(source_error("event stream cancelled")),
-            result = push.run() => result,
-        }
+        push.run().await
     }
 }
 
@@ -94,8 +87,8 @@ impl Push<'_> {
         };
         self.active(active_cursor, page.truncated).await?;
 
-        let mut burst = 0;
         loop {
+            page.has_more &= page.cursor != self.query.cursor;
             if let Err(error) = self.deliver(&mut page).await {
                 if terminal(&error) {
                     return self.finish(error).await;
@@ -109,7 +102,6 @@ impl Push<'_> {
             }
             if !page.has_more {
                 self.query.age_floor = None;
-                burst = 0;
                 let at = emitted
                     .is_none()
                     .then(|| Instant::now() + check_delay(page.next_poll_ms));
@@ -120,12 +112,6 @@ impl Push<'_> {
                     Ok(()) => {}
                     Err(error) if terminal(&error) => return self.finish(error).await,
                     Err(error) => return Err(error),
-                }
-            } else {
-                burst += 1;
-                if burst == 10 {
-                    tokio::task::yield_now().await;
-                    burst = 0;
                 }
             }
             loop {
@@ -179,12 +165,7 @@ impl Push<'_> {
             (descriptor.validate_arguments)(&self.args)?;
         }
         if let Some(authorize) = &descriptor.authorize {
-            timeout(
-                AUTHORIZE_BUDGET,
-                authorize(self.context.clone(), self.args.clone(), DeliveryMode::Push),
-            )
-            .await
-            .map_err(|_| source_error("event authorizer timed out"))??;
+            authorize(self.context.clone(), self.args.clone(), DeliveryMode::Push).await?;
         }
         authorization.grant = Some((descriptor.clone(), Instant::now() + AUTHORIZE_INTERVAL));
         authorization.idle_retry_at = None;
@@ -201,7 +182,7 @@ impl Push<'_> {
             let mut changed = pin!(registry.changes.notified());
             let descriptor = self.current()?;
             if activating && !descriptor.wire.delivery.contains(&DeliveryMode::Push) {
-                return Err(unsupported("push"));
+                return Err(unsupported(DeliveryMode::Push));
             }
             let read = async {
                 self.authorize(&descriptor, authorization).await?;
@@ -215,21 +196,19 @@ impl Push<'_> {
                             registry.epoch,
                             entry.registration,
                             entry.generation,
-                            entry.input_generation,
                             &self.query,
-                        )?),
+                        )),
                     }
                 };
                 match source {
-                    Read::Emit(page) => page.finish(&self.context, &self.args, &descriptor, true),
+                    Read::Emit(page) => {
+                        Ok(page.finish(&self.context, &self.args, &descriptor, true))
+                    }
                     Read::Check(check) => {
-                        let batch = timeout(
-                            LIVE_READ_BUDGET,
-                            check(self.context.clone(), self.args.clone(), self.query.clone()),
-                        )
-                        .await
-                        .map_err(|_| source_error("event source check timed out"))??;
-                        checked_result(batch, &self.query, &self.name, &descriptor, true)
+                        let batch =
+                            check(self.context.clone(), self.args.clone(), self.query.clone())
+                                .await?;
+                        checked_result(batch, &self.query, true)
                     }
                 }
             };
@@ -297,7 +276,7 @@ impl Push<'_> {
         let registry = &self.server.0;
         let mut emitted = pin!(emitted);
         loop {
-            let changed = registry.changes.notified();
+            let mut changed = pin!(registry.changes.notified());
             let descriptor = self.current()?;
             if !Shared::ptr_eq(read_descriptor, &descriptor) {
                 return Ok(());
@@ -308,7 +287,7 @@ impl Push<'_> {
                 .or_else(|| authorization.grant.as_ref().map(|(_, until)| *until))
                 .unwrap_or_else(Instant::now);
             tokio::select! {
-                () = changed => continue,
+                () = &mut changed => continue,
                 () = async {
                     match emitted.as_mut().as_pin_mut() {
                         Some(emit) => emit.await,
@@ -322,9 +301,12 @@ impl Push<'_> {
                     }
                 } => return Ok(()),
                 () = sleep_until(authorize_at), if descriptor.authorize.is_some() => {
-                    let (last_frame, result) = self.heartbeat_while(
-                        self.authorize(&descriptor, authorization),
-                    ).await?;
+                    let (last_frame, result) = tokio::select! {
+                        () = &mut changed => {
+                            return Ok(());
+                        }
+                        result = self.heartbeat_while(self.authorize(&descriptor, authorization)) => result?,
+                    };
                     self.last_frame = last_frame;
                     if !Shared::ptr_eq(&self.current()?, read_descriptor) {
                         return Ok(());
@@ -409,13 +391,6 @@ impl Push<'_> {
             .await
             .map_err(|_| source_error("event stream transport closed"))
     }
-}
-
-fn terminal(error: &EventsError) -> bool {
-    matches!(
-        error,
-        EventsError::NotFound { .. } | EventsError::Forbidden { .. }
-    ) || matches!(error, EventsError::Unsupported { reason: Some(reason), .. } if reason == "schema_changed")
 }
 
 fn check_delay(ms: u64) -> Duration {

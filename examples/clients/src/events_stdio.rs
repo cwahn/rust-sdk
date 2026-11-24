@@ -42,7 +42,7 @@ async fn main() -> anyhow::Result<()> {
                 println!("checkpoint {cursor}");
                 break;
             }
-            EventUpdate::Terminated { error, .. } => return Err(error.into()),
+            EventUpdate::Terminated(error) => return Err(error.into()),
             _ => {}
         }
     }

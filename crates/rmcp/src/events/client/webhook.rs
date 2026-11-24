@@ -32,7 +32,7 @@ impl EventsClient {
             ttl_ms: options.ttl,
         };
         let result: WebhookSubscription = decode_result(
-            self.webhook_request(SUBSCRIBE, &params.name, params.arguments.as_ref(), &params)
+            self.webhook_request(SUBSCRIBE, &params.name, &params)
                 .await?,
         )?;
         result
@@ -55,13 +55,8 @@ impl EventsClient {
             delivery: UnsubscribeDelivery { url: url.into() },
         };
         unsubscribe_result(
-            self.webhook_request(
-                UNSUBSCRIBE,
-                &params.name,
-                params.arguments.as_ref(),
-                &params,
-            )
-            .await?,
+            self.webhook_request(UNSUBSCRIBE, &params.name, &params)
+                .await?,
         )
     }
 
@@ -69,36 +64,21 @@ impl EventsClient {
         &self,
         method: &'static str,
         name: &str,
-        arguments: Option<&JsonObject>,
         params: &impl Serialize,
     ) -> Result<ServerResult, EventsError> {
         self.require_advertisement()?;
-        let body = serde_json::to_value(params)
-            .map_err(|_| EventsError::InvalidParams("invalid webhook parameters".into()))?;
-        for refresh in [false, true] {
-            let descriptor = self.descriptor_cached(name, refresh).await?;
-            if method == SUBSCRIBE && !descriptor.delivery.contains(&DeliveryMode::Webhook) {
-                return Err(EventsError::Unsupported {
-                    feature: "deliveryMode".into(),
-                    value: Some(json!("webhook")),
-                    reason: None,
-                });
+        let body = encode_params(params)?;
+        self.with_route(name, |descriptor| {
+            let body = body.clone();
+            async move {
+                if method == SUBSCRIBE && !descriptor.delivery.contains(&DeliveryMode::Webhook) {
+                    return Err(unsupported(DeliveryMode::Webhook));
+                }
+                self.request(route(method, body, descriptor.input_schema))
+                    .await
             }
-            let request = CustomRequest::new(method, Some(body.clone()));
-            #[cfg(feature = "transport-streamable-http-client")]
-            let request = route(request, arguments, descriptor.input_schema)?;
-            #[cfg(not(feature = "transport-streamable-http-client"))]
-            let _ = arguments;
-            let result = self
-                .peer
-                .send_request(ClientRequest::CustomRequest(request))
-                .await
-                .map_err(from_service);
-            if refresh || !matches!(result, Err(EventsError::HeaderMismatch(_))) {
-                return result;
-            }
-        }
-        unreachable!("header refresh always returns")
+        })
+        .await
     }
 }
 

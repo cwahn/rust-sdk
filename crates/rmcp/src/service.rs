@@ -776,8 +776,6 @@ pub(crate) enum PeerSinkMessage<R: ServiceRole> {
 
 #[derive(Debug, Clone)]
 pub(crate) struct ClientRequestMetadata {
-    #[cfg(all(feature = "events", feature = "client"))]
-    discovered: bool,
     pub protocol_version: ProtocolVersion,
     pub client_info: Implementation,
     pub client_capabilities: ClientCapabilities,
@@ -1138,13 +1136,6 @@ impl<R: ServiceRole> Peer<R> {
     #[cfg(feature = "server")]
     pub(crate) fn request_metadata_required(&self) -> bool {
         self.inline_protocol_version.get().is_some()
-    }
-
-    #[cfg(all(feature = "events", feature = "client"))]
-    pub(crate) fn used_discovery(&self) -> bool {
-        self.client_request_metadata
-            .get()
-            .is_some_and(|metadata| metadata.discovered)
     }
 
     pub fn is_transport_closed(&self) -> bool {
@@ -1655,10 +1646,7 @@ where
                     notification,
                     responder,
                 }) => {
-                    // Fence correlated frames without a live local request. A frame
-                    // already handed off may finish; aborting could split the write.
-                    // A new request reusing the ID lifts the fence, which is safe only
-                    // because the previous response has already made the round trip.
+                    // Drop queued subscription frames after cancellation.
                     if let Some(id) = R::outbound_subscription_id(&notification)
                         && !local_ct_pool.contains_key(&id)
                     {
@@ -2237,7 +2225,7 @@ mod events_backpressure_tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn events_activation_deadline_while_outbound_capacity_is_reserved_leaves_no_route() {
+    async fn events_activation_deadline_under_backpressure() {
         tokio::task::LocalSet::new().run_until(async {
             let runtime = EventsServer::new();
             runtime.register_check(source(), |_, _, _| async {
@@ -2267,7 +2255,7 @@ mod events_backpressure_tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn dropping_events_stream_while_outbound_capacity_is_reserved_cancels_the_source() {
+    async fn dropping_events_stream_under_backpressure_cancels_source() {
         tokio::task::LocalSet::new().run_until(async {
             let runtime = EventsServer::new();
             let entered = Arc::new(tokio::sync::Notify::new());

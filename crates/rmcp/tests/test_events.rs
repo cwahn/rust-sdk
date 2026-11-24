@@ -14,7 +14,7 @@ use rmcp::{
     ServiceExt,
     events::{
         client::{EventUpdate, EventsClient, SubscriptionOptions},
-        server::{CheckQuery, CheckedBatch, Descriptor, EventContext, EventsServer, Replacement},
+        server::{CheckQuery, CheckedBatch, Descriptor, EventsServer, Replacement},
         wire::{DeliveryMode, EventDescriptor, EventOccurrence, EventsError, PollParams},
     },
     model::{
@@ -26,18 +26,16 @@ use rmcp::{
 use serde_json::{Value, json};
 
 const EXTENSION: &str = "io.modelcontextprotocol/events";
+type EventContext = rmcp::service::RequestContext<rmcp::RoleServer>;
 
-fn raw_descriptor(name: &str, input: JsonObject, payload: JsonObject) -> Descriptor {
-    use rmcp::events::wire::EventDescriptor;
+fn raw_descriptor(
+    name: &str,
+    mode: DeliveryMode,
+    input: JsonObject,
+    payload: JsonObject,
+) -> Descriptor {
     Descriptor::raw(
-        EventDescriptor::new(
-            name,
-            "",
-            vec![DeliveryMode::Poll],
-            input.into(),
-            payload.into(),
-        ),
-        |_| Ok(()),
+        EventDescriptor::new(name, "", vec![mode], input.into(), payload.into()),
         |_| Ok(()),
     )
 }
@@ -109,11 +107,7 @@ impl ServerHandler for App {
             // The SDK still honors its own category.
             None
         } else {
-            assert!(
-                !(self.app_settings.as_ref().is_some_and(JsonObject::is_empty)
-                    && requested.events_list_changed == Some(true)),
-                "client must strip the category for an empty advertisement"
-            );
+            assert_eq!(requested.events_list_changed, Some(true));
             Some(requested.clone())
         }
     }
@@ -271,13 +265,17 @@ events_test!(push_stdio_isolates_streams_and_fences_final_after_cancel, {
     wire.request(
         json!("one"),
         "events/stream",
-        json!({"name":"first", "heartbeatMs":1}),
+        json!({"name":"first", "heartbeatMs":0}),
     )
     .await;
     let one = wire.frame(json!("one"), "active").await;
     assert_eq!(one["heartbeatMs"], 1_000);
-    wire.request(json!(2), "events/stream", json!({"name":"second"}))
-        .await;
+    wire.request(
+        json!(2),
+        "events/stream",
+        json!({"name":"second","heartbeatMs":90_000}),
+    )
+    .await;
     let two = wire.frame(json!(2), "active").await;
     assert_eq!(two["heartbeatMs"], 30_000);
     assert_ne!(one["cursor"], two["cursor"]);
@@ -366,36 +364,6 @@ events_test!(push_gap_precedes_replay_and_regrants_heartbeat, {
 });
 
 events_test!(
-    push_breaking_replace_terminates_while_additive_stays_open,
-    {
-        let runtime = EventsServer::new();
-        let emit = runtime.register_emit(push_descriptor("source")).unwrap();
-        let mut wire = Wire::connect(runtime.clone()).await;
-        wire.request(json!(1), "events/stream", json!({"name":"source"}))
-            .await;
-        wire.frame(json!(1), "active").await;
-        runtime
-            .replace(push_descriptor("source"), Replacement::Additive)
-            .unwrap();
-        emit.emit(Some("still-open".into()), Utc::now(), JsonObject::new())
-            .unwrap();
-        assert_eq!(wire.frame(json!(1), "event").await["eventId"], "still-open");
-        runtime
-            .replace(push_descriptor("source"), Replacement::Breaking)
-            .unwrap();
-        let terminated = wire.frame(json!(1), "terminated").await;
-        assert_eq!(terminated["error"]["code"], -32026);
-        assert_eq!(
-            terminated["error"]["data"],
-            json!({
-                "feature":"payloadSchema", "reason":"schema_changed"
-            })
-        );
-        assert_eq!(wire.receive().await["result"]["_meta"][SUBSCRIPTION_ID], 1);
-    }
-);
-
-events_test!(
     push_recoverable_check_failure_then_authorization_revocation,
     35,
     {
@@ -466,21 +434,6 @@ events_test!(
     }
 );
 
-events_test!(push_clamps_zero_and_high_heartbeat_suggestions, {
-    let runtime = EventsServer::new();
-    runtime.register_emit(push_descriptor("source")).unwrap();
-    let mut wire = Wire::connect(runtime).await;
-    for (id, suggestion, grant) in [(1, 0, 1_000), (2, 90_000, 30_000)] {
-        wire.request(
-            json!(id),
-            "events/stream",
-            json!({"name":"source","heartbeatMs":suggestion}),
-        )
-        .await;
-        assert_eq!(wire.frame(json!(id), "active").await["heartbeatMs"], grant);
-    }
-});
-
 events_test!(push_age_floor_ends_after_immediate_backlog_drain, {
     use std::sync::{Arc, Mutex};
     let runtime = EventsServer::new();
@@ -540,71 +493,83 @@ events_test!(push_age_floor_ends_after_immediate_backlog_drain, {
     assert_eq!(reads[2].0 - reads[1].0, Duration::from_secs(1));
 });
 
-events_test!(push_live_read_timeout_sends_a_recoverable_error, 15, {
+events_test!(push_heartbeats_and_terminates_during_pending_read, {
     let runtime = EventsServer::new();
+    let entered = Arc::new(tokio::sync::Notify::new());
     runtime
-        .register_check(push_descriptor("source"), |_, _, query| async move {
-            if query.cursor.is_some() {
-                return std::future::pending().await;
+        .register_check(push_descriptor("source"), {
+            let entered = entered.clone();
+            move |_, _, query| {
+                let entered = entered.clone();
+                async move {
+                    if query.cursor.is_some() {
+                        entered.notify_one();
+                        return pending().await;
+                    }
+                    let mut page = CheckedBatch::new("head");
+                    page.next_poll_ms = Some(1_000);
+                    Ok(page)
+                }
             }
-            let mut page = CheckedBatch::new("head");
-            page.next_poll_ms = Some(1_000);
-            Ok(page)
         })
         .unwrap();
-    let mut wire = Wire::connect(runtime).await;
-    wire.request(json!(1), "events/stream", json!({"name":"source"}))
-        .await;
+    let mut wire = Wire::connect(runtime.clone()).await;
+    wire.request(
+        json!(1),
+        "events/stream",
+        json!({"name":"source","heartbeatMs":1000}),
+    )
+    .await;
     wire.frame(json!(1), "active").await;
-    let start = tokio::time::Instant::now();
-    let error = wire.frame(json!(1), "error").await;
-    assert_eq!(error["error"]["message"], "event source check timed out");
-    assert_eq!(start.elapsed(), Duration::from_secs(11));
+    entered.notified().await;
+    assert_eq!(wire.frame(json!(1), "heartbeat").await["cursor"], "head");
+    runtime.remove("source").unwrap();
+    assert_eq!(
+        wire.frame(json!(1), "terminated").await["error"]["code"],
+        -32023
+    );
 });
 
-events_test!(push_only_rejects_poll_and_input_break_terminates, {
-    let runtime = EventsServer::new();
-    runtime
-        .register_emit(Descriptor::typed::<JsonObject, JsonObject>(
-            "source",
-            "",
-            [DeliveryMode::Push],
-        ))
-        .unwrap();
-    let mut wire = Wire::connect(runtime.clone()).await;
-    wire.request(json!(1), "events/poll", json!({"name":"source"}))
-        .await;
-    let unsupported = wire.receive().await;
-    assert_eq!(unsupported["error"]["code"], -32026);
-    assert_eq!(
-        unsupported["error"]["data"],
-        json!({"feature":"deliveryMode","value":"poll"})
-    );
-    wire.request(json!(2), "events/stream", json!({"name":"source"}))
-        .await;
-    wire.frame(json!(2), "active").await;
-    runtime
-        .replace(
-            Descriptor::raw(
-                rmcp::events::wire::EventDescriptor::new(
-                    "source",
-                    "",
-                    vec![DeliveryMode::Push],
-                    object(json!({"type":"object","required":["new"]})).into(),
-                    Default::default(),
-                ),
-                |_| Ok(()),
-                |_| Ok(()),
-            ),
-            Replacement::Breaking,
-        )
-        .unwrap();
-    let terminated = wire.frame(json!(2), "terminated").await;
-    assert_eq!(
-        terminated["error"]["data"],
-        json!({"feature":"inputSchema","reason":"schema_changed"})
-    );
-    assert_eq!(wire.receive().await["result"]["_meta"][SUBSCRIPTION_ID], 2);
+events_test!(push_replacement, {
+    let mode = DeliveryMode::Push;
+    let changed = object(json!({"type":"object","required":["new"]}));
+    for (schema, expected) in [
+        (JsonObject::new(), "payloadSchema"),
+        (changed, "inputSchema"),
+    ] {
+        let runtime = EventsServer::new();
+        let source = || raw_descriptor("source", mode, JsonObject::new(), JsonObject::new());
+        let emit = runtime.register_emit(source()).unwrap();
+        let mut wire = Wire::connect(runtime.clone()).await;
+        wire.request(json!(1), "events/poll", json!({"name":"source"}))
+            .await;
+        let response = wire.receive().await;
+        assert_eq!(response["error"]["code"], -32026);
+        assert_eq!(
+            response["error"]["data"],
+            json!({"feature":"deliveryMode","value":"poll"})
+        );
+        wire.request(json!(2), "events/stream", json!({"name":"source"}))
+            .await;
+        wire.frame(json!(2), "active").await;
+        runtime.replace(source(), Replacement::Additive).unwrap();
+        emit.emit(Some("still-open".into()), Utc::now(), JsonObject::new())
+            .unwrap();
+        assert_eq!(wire.frame(json!(2), "event").await["eventId"], "still-open");
+        runtime
+            .replace(
+                raw_descriptor("source", mode, schema, object(json!({"type":"object"}))),
+                Replacement::Breaking,
+            )
+            .unwrap();
+        let terminated = wire.frame(json!(2), "terminated").await;
+        assert_eq!(terminated["error"]["code"], -32026);
+        assert_eq!(
+            terminated["error"]["data"],
+            json!({"feature":expected,"reason":"schema_changed"})
+        );
+        assert_eq!(wire.receive().await["result"]["_meta"][SUBSCRIPTION_ID], 2);
+    }
 });
 
 events_test!(stdio_eof_ends_delivery_at_the_last_checkpoint, {
@@ -661,9 +626,10 @@ events_test!(stdio_eof_ends_delivery_at_the_last_checkpoint, {
     stop.cancel();
     task.await.unwrap();
     client.waiting().await.unwrap();
-    assert!(matches!(events.next().await, Some(EventUpdate::Terminated {
-        error: EventsError::Service(error), cursor: Some(cursor),
-    }) if matches!(*error, ServiceError::TransportClosed) && cursor == saved));
+    assert_eq!(saved, "head");
+    assert!(matches!(events.next().await, Some(EventUpdate::Terminated(
+        EventsError::Service(error),
+    )) if matches!(*error, ServiceError::TransportClosed)));
     assert!(events.next().await.is_none());
 });
 
@@ -813,39 +779,44 @@ events_test!(managed_poll_drains_progress_then_observes_floor, {
     assert_eq!(at[3] - at[2], Duration::from_secs(1));
 });
 
-#[derive(Clone)]
-struct PushPeer {
-    flood: bool,
-    go: std::sync::Arc<tokio::sync::Notify>,
-    sent: std::sync::Arc<tokio::sync::Notify>,
-    opens: std::sync::Arc<std::sync::Mutex<Vec<(rmcp::model::RequestId, Value)>>>,
-}
-
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum ReviewScenario {
+enum Scenario {
+    Watchdog,
+    Overflow,
     ClosingPush,
     PushActivation,
     Poll,
 }
 
 #[derive(Clone)]
-struct ReviewPeer {
-    scenario: ReviewScenario,
+struct ScriptedPeer {
+    scenario: Scenario,
     calls: std::sync::Arc<std::sync::Mutex<Vec<(tokio::time::Instant, Value)>>>,
+    go: Arc<tokio::sync::Notify>,
+    sent: Arc<tokio::sync::Notify>,
+    opens: Arc<std::sync::Mutex<Vec<(rmcp::model::RequestId, Value)>>>,
 }
 
-impl ReviewPeer {
-    fn new(scenario: ReviewScenario) -> Self {
+impl ScriptedPeer {
+    fn new(scenario: Scenario) -> Self {
         Self {
             scenario,
             calls: Default::default(),
+            go: Default::default(),
+            sent: Default::default(),
+            opens: Default::default(),
         }
     }
 }
 
-impl ServerHandler for ReviewPeer {
+impl ServerHandler for ScriptedPeer {
     fn get_info(&self) -> ServerConfig {
-        PushPeer::new(false).get_info()
+        let mut info = ServerConfig::default();
+        info.capabilities
+            .extensions
+            .get_or_insert_default()
+            .insert(EXTENSION.into(), JsonObject::new());
+        info
     }
 
     async fn on_custom_request(
@@ -854,7 +825,7 @@ impl ServerHandler for ReviewPeer {
         ctx: EventContext,
     ) -> Result<CustomResult, ErrorData> {
         if request.method == "events/list" {
-            let delivery = if self.scenario == ReviewScenario::Poll {
+            let delivery = if self.scenario == Scenario::Poll {
                 json!(["poll"])
             } else {
                 json!(["push", "poll"])
@@ -865,33 +836,60 @@ impl ServerHandler for ReviewPeer {
         }
         assert_eq!(
             request.method,
-            if self.scenario == ReviewScenario::Poll {
+            if self.scenario == Scenario::Poll {
                 "events/poll"
             } else {
                 "events/stream"
             }
         );
+        let params = request.params.unwrap();
         let call = {
             let mut calls = self.calls.lock().unwrap();
-            calls.push((tokio::time::Instant::now(), request.params.unwrap()));
+            calls.push((tokio::time::Instant::now(), params.clone()));
             calls.len()
         };
         let problem = |code, message| ErrorData::new(ErrorCode(code), message, None);
         match (self.scenario, call) {
-            (ReviewScenario::PushActivation | ReviewScenario::Poll, 1) => {
-                std::future::pending().await
-            }
-            (ReviewScenario::PushActivation | ReviewScenario::Poll, 2) => {
-                Err(problem(-32603, "transient"))
-            }
-            (ReviewScenario::PushActivation, 3) => Err(problem(-32024, "denied")),
-            (ReviewScenario::Poll, 3..=5) => Ok(CustomResult(json!({
+            (Scenario::PushActivation | Scenario::Poll, 1) => std::future::pending().await,
+            (Scenario::PushActivation | Scenario::Poll, 2) => Err(problem(-32603, "transient")),
+            (Scenario::PushActivation, 3) => Err(problem(-32024, "denied")),
+            (Scenario::Poll, 3..=5) => Ok(CustomResult(json!({
                 "resultType":"complete", "events":[], "cursor": if call == 5 { "next" } else { "head" },
                 "hasMore":true, "nextPollMs":999_999
             }))),
-            (ReviewScenario::Poll, 6) => Err(problem(-32023, "removed")),
-            (ReviewScenario::ClosingPush, 1..=2) => {
-                PushPeer::send(
+            (Scenario::Poll, 6) => Err(problem(-32023, "removed")),
+            (Scenario::Watchdog | Scenario::Overflow, _) => {
+                let cursor = params["cursor"].clone();
+                self.opens
+                    .lock()
+                    .unwrap()
+                    .push((ctx.id.clone(), cursor.clone()));
+                let start = if call == 1 { json!("head") } else { cursor };
+                Self::send(&ctx, "active", json!({"cursor":start, "heartbeatMs":1_000})).await;
+                match (self.scenario, call) {
+                    (Scenario::Overflow, 1) => {
+                        self.go.notified().await;
+                        for index in 0..70 {
+                            Self::event(&ctx, &format!("event{index}"), &format!("pos{index}"))
+                                .await;
+                        }
+                        self.sent.notify_one();
+                    }
+                    (Scenario::Overflow, _) => {
+                        Self::event(&ctx, "after-reconnect", "reconnected").await
+                    }
+                    _ => {
+                        Self::event(&ctx, "a", "a-end").await;
+                        if call > 1 {
+                            Self::event(&ctx, "b", "b-end").await;
+                        }
+                    }
+                }
+                ctx.ct.cancelled().await;
+                Err(problem(-32603, "cancelled"))
+            }
+            (Scenario::ClosingPush, 1..=2) => {
+                Self::send(
                     &ctx,
                     "active",
                     json!({"cursor":"head","heartbeatMs":30_000}),
@@ -901,15 +899,15 @@ impl ServerHandler for ReviewPeer {
                     json!({"resultType":"complete","_meta":{SUBSCRIPTION_ID:ctx.id}}),
                 ))
             }
-            (ReviewScenario::ClosingPush, 3) => {
-                PushPeer::send(&ctx, "unknown", json!({})).await;
-                PushPeer::send(
+            (Scenario::ClosingPush, 3) => {
+                Self::send(&ctx, "unknown", json!({})).await;
+                Self::send(
                     &ctx,
                     "active",
                     json!({"cursor":"fresh","truncated":true,"heartbeatMs":30_000}),
                 )
                 .await;
-                PushPeer::send(
+                Self::send(
                     &ctx,
                     "error",
                     json!({"error":{"code":-32603,"message":"recoverable"}}),
@@ -933,7 +931,7 @@ impl ServerHandler for ReviewPeer {
                     .send_notification(ServerNotification::CustomNotification(notification))
                     .await
                     .unwrap();
-                PushPeer::send(
+                Self::send(
                     &ctx,
                     "terminated",
                     json!({"error":{"code":-32024,"message":"denied"}}),
@@ -950,7 +948,7 @@ impl ServerHandler for ReviewPeer {
 events_test!(
     bare_push_completion_reconnects_with_backoff_and_yields_gap_and_error,
     {
-        let fixture = ReviewPeer::new(ReviewScenario::ClosingPush);
+        let fixture = ScriptedPeer::new(Scenario::ClosingPush);
         let client = exchange(fixture.clone(), modern()).await;
         let api = EventsClient::new(client.peer().clone());
         let mut options = SubscriptionOptions::default();
@@ -981,10 +979,7 @@ events_test!(
         );
         assert!(matches!(
             events.next().await,
-            Some(EventUpdate::Terminated {
-                error: EventsError::Forbidden { .. },
-                ..
-            })
+            Some(EventUpdate::Terminated(EventsError::Forbidden { .. }))
         ));
         assert!(events.next().await.is_none());
         let calls = fixture.calls.lock().unwrap();
@@ -1001,7 +996,7 @@ events_test!(
 );
 
 events_test!(push_activation_deadline_and_retry_classifier, 20, {
-    let client = exchange(ReviewPeer::new(ReviewScenario::PushActivation), modern()).await;
+    let client = exchange(ScriptedPeer::new(Scenario::PushActivation), modern()).await;
     let api = EventsClient::new(client.peer().clone());
     let mut events = api
         .subscribe("source", None, Default::default())
@@ -1019,16 +1014,13 @@ events_test!(push_activation_deadline_and_retry_classifier, 20, {
     );
     assert!(matches!(
         events.next().await,
-        Some(EventUpdate::Terminated {
-            error: EventsError::Forbidden { .. },
-            cursor: None
-        })
+        Some(EventUpdate::Terminated(EventsError::Forbidden { .. }))
     ));
     assert!(events.next().await.is_none());
 });
 
 events_test!(managed_poll_retries_times_out_and_falls_back_to_poll, 22, {
-    let fixture = ReviewPeer::new(ReviewScenario::Poll);
+    let fixture = ScriptedPeer::new(Scenario::Poll);
     let client = exchange(fixture.clone(), modern()).await;
     let api = EventsClient::new(client.peer().clone());
     let mut forced = SubscriptionOptions::default();
@@ -1055,9 +1047,10 @@ events_test!(managed_poll_retries_times_out_and_falls_back_to_poll, 22, {
     assert!(
         matches!(events.next().await, Some(EventUpdate::Checkpoint(cursor)) if cursor == "next")
     );
-    assert!(
-        matches!(events.next().await, Some(EventUpdate::Terminated { error: EventsError::NotFound { .. }, cursor: Some(cursor) }) if cursor == "next")
-    );
+    assert!(matches!(
+        events.next().await,
+        Some(EventUpdate::Terminated(EventsError::NotFound { .. }))
+    ));
     assert!(events.next().await.is_none());
     let calls = fixture.calls.lock().unwrap();
     assert_eq!(calls.len(), 6);
@@ -1076,16 +1069,7 @@ events_test!(managed_poll_retries_times_out_and_falls_back_to_poll, 22, {
     );
 });
 
-impl PushPeer {
-    fn new(flood: bool) -> Self {
-        Self {
-            flood,
-            go: Default::default(),
-            sent: Default::default(),
-            opens: Default::default(),
-        }
-    }
-
+impl ScriptedPeer {
     async fn send(context: &EventContext, method: &str, params: Value) {
         let mut note = rmcp::model::CustomNotification::new(
             format!("notifications/events/{method}"),
@@ -1112,104 +1096,46 @@ impl PushPeer {
     }
 }
 
-impl ServerHandler for PushPeer {
-    fn get_info(&self) -> ServerConfig {
-        let mut info = ServerConfig::default();
-        info.capabilities
-            .extensions
-            .get_or_insert_default()
-            .insert(EXTENSION.into(), JsonObject::new());
-        info
-    }
-
-    async fn on_custom_request(
-        &self,
-        request: CustomRequest,
-        context: EventContext,
-    ) -> Result<CustomResult, ErrorData> {
-        match request.method.as_str() {
-            "events/list" => Ok(CustomResult(json!({
-                "resultType":"complete", "events":[{
-                    "name":"source", "delivery":["poll","push"], "inputSchema":{}, "payloadSchema":{}
-                }]
-            }))),
-            "events/stream" => {
-                let cursor = request.params.unwrap()["cursor"].clone();
-                let open = {
-                    let mut opens = self.opens.lock().unwrap();
-                    opens.push((context.id.clone(), cursor.clone()));
-                    opens.len()
-                };
-                let start = if open == 1 { json!("head") } else { cursor };
-                Self::send(
-                    &context,
-                    "active",
-                    json!({"cursor":start, "heartbeatMs":1_000}),
-                )
-                .await;
-                if open == 1 && self.flood {
-                    self.go.notified().await;
-                    for index in 0..70 {
-                        Self::event(&context, &format!("event{index}"), &format!("pos{index}"))
-                            .await;
-                    }
-                    self.sent.notify_one();
-                } else if open == 1 {
-                    Self::event(&context, "a", "a-end").await;
-                } else if !self.flood {
-                    Self::event(&context, "a", "a-end").await;
-                    Self::event(&context, "b", "b-end").await;
-                } else {
-                    Self::event(&context, "after-reconnect", "reconnected").await;
-                }
-                context.ct.cancelled().await;
-                Err(ErrorData::internal_error("scripted stream cancelled", None))
-            }
-            other => panic!("unexpected method {other}"),
-        }
-    }
-}
-
-events_test!(
-    push_watchdog_reconnects_from_consumed_events_cursor_and_deduplicates,
-    {
-        let script = PushPeer::new(false);
-        let client = exchange(script.clone(), modern()).await;
-        let client_api = EventsClient::new(client.peer().clone());
-        let mut events = client_api
-            .subscribe("source", None, SubscriptionOptions::default())
-            .await
-            .unwrap();
-        assert!(
-            matches!(events.next().await, Some(EventUpdate::Checkpoint(cursor)) if cursor == "head")
-        );
-        assert!(
-            matches!(events.next().await, Some(EventUpdate::Occurrence(event)) if event.event_id == "a")
-        );
-        assert!(
-            matches!(events.next().await, Some(EventUpdate::Checkpoint(cursor)) if cursor == "a-end")
-        );
-        let before = tokio::time::Instant::now();
-        assert!(
-            matches!(events.next().await, Some(EventUpdate::RecoverableError(EventsError::Service(e)))
+events_test!(push_watchdog_reconnects_from_last_checkpoint, {
+    let script = ScriptedPeer::new(Scenario::Watchdog);
+    let client = exchange(script.clone(), modern()).await;
+    let client_api = EventsClient::new(client.peer().clone());
+    let mut events = client_api
+        .subscribe("source", None, SubscriptionOptions::default())
+        .await
+        .unwrap();
+    assert!(
+        matches!(events.next().await, Some(EventUpdate::Checkpoint(cursor)) if cursor == "head")
+    );
+    assert!(
+        matches!(events.next().await, Some(EventUpdate::Occurrence(event)) if event.event_id == "a")
+    );
+    assert!(
+        matches!(events.next().await, Some(EventUpdate::Checkpoint(cursor)) if cursor == "a-end")
+    );
+    let before = tokio::time::Instant::now();
+    assert!(
+        matches!(events.next().await, Some(EventUpdate::RecoverableError(EventsError::Service(e)))
         if matches!(*e, ServiceError::Timeout { timeout } if timeout == Duration::from_secs(3)))
-        );
-        assert_eq!(before.elapsed(), Duration::from_secs(3));
-        assert!(
-            matches!(events.next().await, Some(EventUpdate::Occurrence(event)) if event.event_id == "b")
-        );
-        let opens = script.opens.lock().unwrap();
-        assert_eq!(opens.len(), 2);
-        assert_ne!(opens[0].0, opens[1].0);
-        assert!(opens[0].1.is_null());
-        assert_eq!(opens[1].1, "a-end");
-    }
-);
+    );
+    assert_eq!(before.elapsed(), Duration::from_secs(3));
+    assert!(
+        matches!(events.next().await, Some(EventUpdate::Occurrence(event)) if event.event_id == "a")
+    );
+    assert!(
+        matches!(events.next().await, Some(EventUpdate::Occurrence(event)) if event.event_id == "b")
+    );
+    let opens = script.opens.lock().unwrap();
+    assert_eq!(opens.len(), 2);
+    assert_ne!(opens[0].0, opens[1].0);
+    assert!(opens[0].1.is_null());
+    assert_eq!(opens[1].1, "a-end");
+});
 
 events_test!(
     push_overflow_is_observable_and_resumes_after_only_consumed_frames,
     {
-        let script = PushPeer::new(true);
+        let script = ScriptedPeer::new(Scenario::Overflow);
         let client = exchange(script.clone(), modern()).await;
         let client_api = EventsClient::new(client.peer().clone());
         let mut events = client_api
@@ -1246,69 +1172,17 @@ events_test!(
     }
 );
 
-events_test!(emit_additive_replace_during_validation, {
-    use std::sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    };
-
-    use rmcp::events::wire::EventDescriptor;
-    let runtime = EventsServer::new();
-    let registry = runtime.clone();
-    let revalidated = Arc::new(AtomicUsize::new(0));
-    let probe = revalidated.clone();
-    let wire = EventDescriptor::new(
-        "emit",
-        "",
-        vec![DeliveryMode::Poll],
-        Default::default(),
-        Default::default(),
-    );
-    let previous = wire.clone();
-    let emit = runtime
-        .register_emit(Descriptor::raw(
-            wire,
-            |_| Ok(()),
-            move |_| {
-                let probe = probe.clone();
-                registry.replace(
-                    Descriptor::raw(
-                        previous.clone(),
-                        |_| Ok(()),
-                        move |_| {
-                            probe.fetch_add(1, Ordering::SeqCst);
-                            Ok(())
-                        },
-                    ),
-                    Replacement::Additive,
-                )
-            },
-        ))
-        .unwrap();
-    let client = exchange(
-        App {
-            events: Some(runtime),
-            ..App::default()
-        },
-        modern(),
-    )
-    .await;
-    let events = EventsClient::new(client.peer().clone());
-    let mut poll = PollParams::new("emit");
-    poll.cursor = events.poll(poll.clone()).await.unwrap().cursor;
-    emit.emit(Some("kept".into()), Utc::now(), JsonObject::new())
-        .unwrap();
-    assert_eq!(revalidated.load(Ordering::SeqCst), 1);
-    assert_eq!(events.poll(poll).await.unwrap().events[0].event_id, "kept");
-    client.cancel().await.unwrap();
-});
-
 events_test!(
     emit_byte_eviction_breaking_replacement_and_reregistration,
     {
         let runtime = EventsServer::new();
         let emit = runtime
-            .register_emit(raw_descriptor("emit", JsonObject::new(), JsonObject::new()))
+            .register_emit(raw_descriptor(
+                "emit",
+                DeliveryMode::Poll,
+                JsonObject::new(),
+                JsonObject::new(),
+            ))
             .unwrap();
         let client = exchange(
             App {
@@ -1345,25 +1219,24 @@ events_test!(
         let input = object(json!({"type":"object"}));
         runtime
             .replace(
-                raw_descriptor("emit", input.clone(), JsonObject::new()),
+                raw_descriptor("emit", DeliveryMode::Poll, input.clone(), JsonObject::new()),
                 Replacement::Breaking,
             )
             .unwrap();
-        assert!(
-            matches!(events.poll(poll.clone()).await, Err(EventsError::Unsupported { feature, reason, .. })
-        if feature == "inputSchema" && reason.as_deref() == Some("schema_changed"))
-        );
+        assert!(events.poll(poll.clone()).await.unwrap().truncated);
         poll.cursor = events.poll(PollParams::new("emit")).await.unwrap().cursor;
         runtime
             .replace(
-                raw_descriptor("emit", input, object(json!({"type":"object"}))),
+                raw_descriptor(
+                    "emit",
+                    DeliveryMode::Poll,
+                    input,
+                    object(json!({"type":"object"})),
+                ),
                 Replacement::Breaking,
             )
             .unwrap();
-        assert!(
-            matches!(events.poll(poll.clone()).await, Err(EventsError::Unsupported { feature, reason, .. })
-        if feature == "payloadSchema" && reason.as_deref() == Some("schema_changed"))
-        );
+        assert!(events.poll(poll.clone()).await.unwrap().truncated);
         runtime.remove("emit").unwrap();
         assert!(matches!(
             events.poll(poll.clone()).await,
@@ -1388,16 +1261,9 @@ events_test!(
     }
 );
 
-events_test!(emit_transform_byte_cut_and_failure_preserve_cursor, {
+events_test!(emit_filter_advances_cursor, {
     let runtime = EventsServer::new();
-    let selected = descriptor("emit")
-        .matches(|_, event, _| event.event_id != "filtered")
-        .transform(|_, event, args| {
-            if event.event_id == "2" && args.contains_key("fail") {
-                return Err(EventsError::InvalidParams("transform fixture".into()));
-            }
-            Ok(object(json!({"blob":"x".repeat(100 * 1024)})))
-        });
+    let selected = descriptor("emit").matches(|_, event, _| event.event_id != "filtered");
     assert!(matches!(
         runtime.register_check(selected.clone(), |_, _, _| ready(Ok(CheckedBatch::new(
             "head"
@@ -1422,45 +1288,16 @@ events_test!(emit_transform_byte_cut_and_failure_preserve_cursor, {
     assert!(quiet.events.is_empty());
     assert_ne!(quiet.cursor, poll.cursor);
     poll.cursor = quiet.cursor;
-    for index in 1..=3 {
-        emit.emit(Some(index.to_string()), Utc::now(), JsonObject::new())
-            .unwrap();
-    }
-    poll.arguments = Some(object(json!({"fail":true})));
-    assert!(
-        matches!(events.poll(poll.clone()).await, Err(EventsError::InvalidParams(reason)) if reason == "transform fixture")
-    );
-    poll.arguments = None;
-    let first = events.poll(poll.clone()).await.unwrap();
-    assert_eq!(
-        first
-            .events
-            .iter()
-            .map(|event| event.event_id.as_str())
-            .collect::<Vec<_>>(),
-        ["1", "2"]
-    );
-    assert!(first.has_more);
-    poll.cursor = first.cursor;
-    let last = events.poll(poll).await.unwrap();
-    assert_eq!(last.events[0].event_id, "3");
-    assert!(!last.has_more);
+    emit.emit(Some("kept".into()), Utc::now(), JsonObject::new())
+        .unwrap();
+    let result = events.poll(poll).await.unwrap();
+    assert_eq!(result.events[0].event_id, "kept");
     client.cancel().await.unwrap();
 });
 
-events_test!(oversized_transformed_occurrence_does_not_advance_replay, {
+events_test!(oversized_emit_does_not_advance_replay, {
     let runtime = EventsServer::new();
-    let emit = runtime
-        .register_emit(
-            descriptor("emit").transform(|_: &EventContext, event, args| {
-                if args.contains_key("enlarge") {
-                    Ok(object(json!({"blob":"x".repeat(256 * 1024 + 1)})))
-                } else {
-                    Ok(event.data.clone())
-                }
-            }),
-        )
-        .unwrap();
+    let emit = runtime.register_emit(descriptor("emit")).unwrap();
     let client = exchange(
         App {
             events: Some(runtime),
@@ -1474,12 +1311,10 @@ events_test!(oversized_transformed_occurrence_does_not_advance_replay, {
     poll.cursor = events.poll(poll.clone()).await.unwrap().cursor;
     emit.emit(Some("kept".into()), Utc::now(), JsonObject::new())
         .unwrap();
-    poll.arguments = Some(object(json!({"enlarge":true})));
     assert!(matches!(
-        events.poll(poll.clone()).await,
+        emit.emit(None, Utc::now(), object(json!({"blob":"x".repeat(256 * 1024 + 1)}))),
         Err(EventsError::ResourceExhausted { limit, max: Some(262_144) }) if limit == "eventBytes"
     ));
-    poll.arguments = None;
     let result = events.poll(poll.clone()).await.unwrap();
     assert_eq!(result.events[0].event_id, "kept");
     assert_ne!(result.cursor, poll.cursor);
@@ -1646,7 +1481,7 @@ events_test!(
     }
 );
 
-events_test!(catalog_pagination_and_changes_before_the_watcher, {
+events_test!(catalog_change_before_watcher, {
     let runtime = EventsServer::new();
     for index in (0..40).rev() {
         register(&runtime, &format!("{index:02}"));
@@ -1662,17 +1497,16 @@ events_test!(catalog_pagination_and_changes_before_the_watcher, {
     .await;
     let events = EventsClient::new(client.peer().clone());
     let page = events.list_page(None).await.unwrap();
-    let next = page.next_cursor.unwrap();
+    assert!(page.next_cursor.is_none());
     assert_eq!(
         page.events
             .iter()
             .map(|event| event.name.clone())
             .collect::<Vec<_>>(),
-        (0..32)
+        (0..40)
             .map(|index| format!("{index:02}"))
             .collect::<Vec<_>>()
     );
-    assert_eq!(events.list_page(Some(&next)).await.unwrap().events.len(), 8);
     assert!(matches!(
         events.list_page(Some("garbage")).await,
         Err(EventsError::InvalidParams(_))
@@ -1702,10 +1536,6 @@ events_test!(catalog_pagination_and_changes_before_the_watcher, {
             .is_err(),
         "revisions coalesce"
     );
-    assert!(matches!(
-        events.list_page(Some(&next)).await,
-        Err(EventsError::InvalidParams(_))
-    ));
     stream.cancel().await.unwrap();
     client.cancel().await.unwrap();
 });
@@ -1814,56 +1644,6 @@ events_test!(check_byte_cut_and_age_floor_including_large_unsigned_age, {
     let last = events.poll(poll).await.unwrap();
     assert_eq!(last.events[0].event_id, "3");
     assert!(!last.has_more);
-    client.cancel().await.unwrap();
-});
-
-events_test!(breaking_replace_rejects_an_in_flight_check_result, {
-    let runtime = EventsServer::new();
-    let entered = Arc::new(tokio::sync::Notify::new());
-    let release = Arc::new(tokio::sync::Notify::new());
-    runtime
-        .register_check(descriptor("a"), {
-            let (entered, release) = (entered.clone(), release.clone());
-            move |_, _, _| {
-                let (entered, release) = (entered.clone(), release.clone());
-                async move {
-                    entered.notify_one();
-                    release.notified().await;
-                    Ok(CheckedBatch::new("obsolete"))
-                }
-            }
-        })
-        .unwrap();
-    let client = exchange(
-        App {
-            events: Some(runtime.clone()),
-            ..App::default()
-        },
-        modern(),
-    )
-    .await;
-    let events = EventsClient::new(client.peer().clone());
-    let (result, ()) = tokio::join!(events.poll(PollParams::new("a")), async {
-        entered.notified().await;
-        let new = EventDescriptor::new(
-            "a",
-            "",
-            vec![DeliveryMode::Poll],
-            object(json!({"type":"object","additionalProperties":false})).into(),
-            Default::default(),
-        );
-        runtime
-            .replace(
-                Descriptor::raw(new, |_| Ok(()), |_| Ok(())),
-                Replacement::Breaking,
-            )
-            .unwrap();
-        release.notify_one();
-    });
-    assert!(
-        matches!(result, Err(EventsError::Unsupported { feature, reason, .. })
-        if feature == "inputSchema" && reason.as_deref() == Some("schema_changed"))
-    );
     client.cancel().await.unwrap();
 });
 

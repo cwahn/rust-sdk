@@ -1065,44 +1065,6 @@ fn validate_standard_headers(
     Ok(())
 }
 
-/// Events resolves the installed registry entry once inside validated dispatch.
-/// Check its routing fields against the actual HTTP request without recreating
-/// a handler or imposing Events routing on app-owned custom requests.
-#[cfg(all(feature = "events", feature = "server"))]
-pub(crate) fn validate_event_routing(
-    context: &RequestContext<RoleServer>,
-    method: &str,
-    params: &serde_json::Value,
-    name: &str,
-    schema: Option<&JsonObject>,
-) -> Result<(), crate::events::wire::EventsError> {
-    use crate::events::wire::EventsError;
-    if let Some(parts) = context.extensions.get::<http::request::Parts>() {
-        if let Some(schema) = schema {
-            let arguments = match params.get("arguments") {
-                None | Some(serde_json::Value::Null) => None,
-                Some(serde_json::Value::Object(object)) => Some(object),
-                _ => {
-                    return Err(EventsError::InvalidParams(
-                        "arguments must be an object".into(),
-                    ));
-                }
-            };
-            mcp_headers::validate_event_header_arguments(arguments, schema)
-                .map_err(EventsError::InvalidParams)?;
-        }
-        mcp_headers::validate_routing_headers::<true>(
-            &parts.headers,
-            method,
-            Some(params),
-            Some(name),
-            schema,
-        )
-        .map_err(EventsError::HeaderMismatch)?;
-    }
-    Ok(())
-}
-
 fn forbidden_response(message: impl Into<String>) -> BoxResponse {
     Response::builder()
         .status(http::StatusCode::FORBIDDEN)
@@ -1686,7 +1648,6 @@ where
         receiver: tokio::sync::mpsc::Receiver<ServerJsonRpcMessage>,
         request_ct: CancellationToken,
         long_lived: bool,
-        keep_alive: Option<Duration>,
     ) -> BoxResponse {
         // Long-lived requests are bound to this connection. Do not prime or
         // store their SSE frames, and cancel them when the response is dropped.
@@ -1694,7 +1655,7 @@ where
             let stream = self.persisted_stateless_stream(first, receiver, request_ct, event_store);
             sse_stream_response(
                 stream,
-                keep_alive,
+                self.config.sse_keep_alive,
                 self.config.cancellation_token.child_token(),
             )
         } else {
@@ -1706,7 +1667,7 @@ where
                 });
             sse_stream_response(
                 CancelOnDisconnect::new(stream, request_ct),
-                keep_alive,
+                self.config.sse_keep_alive,
                 self.config.cancellation_token.child_token(),
             )
         }
@@ -1790,12 +1751,7 @@ where
             return jsonrpc_message_response(first, status);
         }
 
-        let keep_alive = if sdk_events_stream {
-            None
-        } else {
-            self.config.sse_keep_alive
-        };
-        Ok(self.stateless_sse_response(Some(first), receiver, request_ct, long_lived, keep_alive))
+        Ok(self.stateless_sse_response(Some(first), receiver, request_ct, long_lived))
     }
 
     /// Looks up `name`'s input schema for SEP-2243 `Mcp-Param-*` validation.
@@ -2554,17 +2510,10 @@ where
                                 receiver,
                                 request_ct,
                                 false,
-                                self.config.sse_keep_alive,
                             ))
                         }
                     } else {
-                        Ok(self.stateless_sse_response(
-                            None,
-                            receiver,
-                            request_ct,
-                            false,
-                            self.config.sse_keep_alive,
-                        ))
+                        Ok(self.stateless_sse_response(None, receiver, request_ct, false))
                     }
                 }
                 ClientJsonRpcMessage::Notification(_notification) => {

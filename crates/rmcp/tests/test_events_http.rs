@@ -24,10 +24,10 @@ use rmcp::{
     ClientLifecycleMode, ClientServiceExt, ServerHandler,
     events::{
         client::{EventUpdate, EventsClient, SubscriptionOptions},
-        server::{CheckedBatch, Descriptor, EventContext, EventsServer, Replacement},
+        server::{CheckedBatch, Descriptor, EventsServer, Replacement},
         wire::{DeliveryMode, EventDescriptor, EventsError, PollParams},
     },
-    model::{ClientConfig, JsonObject, ProtocolVersion, SubscriptionFilter},
+    model::{ClientConfig, JsonObject, ProtocolVersion},
     transport::{
         StreamableHttpClientTransport,
         streamable_http_client::StreamableHttpClientTransportConfig,
@@ -42,6 +42,8 @@ use rmcp::{
 };
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
+
+type EventContext = rmcp::service::RequestContext<rmcp::RoleServer>;
 
 #[derive(Clone)]
 struct App(Option<EventsServer>, bool);
@@ -98,7 +100,6 @@ fn descriptor(name: &str, annotation: &str) -> Descriptor {
             input_schema(annotation),
             Arc::new(JsonObject::new()),
         ),
-        |_| Ok(()),
         |_| Ok(()),
     )
 }
@@ -455,20 +456,18 @@ async fn push_http_eof_reopens_with_events_cursor_and_fresh_request_id() {
         );
         let router = axum::Router::new().nest_service("/mcp", service).layer(middleware);
         let (url, stop, task) = serve_router(router, stop).await;
-        let client = ClientConfig::default().serve_with_lifecycle(
-            StreamableHttpClientTransport::from_uri(url), ClientLifecycleMode::Discover {
-                preferred_versions: vec![ProtocolVersion::V_2026_07_28]
-            },
-        ).await.unwrap();
+        let client = connect(url).await;
         let api = EventsClient::new(client.peer().clone());
         let mut events = api.subscribe("source", None, SubscriptionOptions::default()).await.unwrap();
         assert!(matches!(events.next().await, Some(EventUpdate::Checkpoint(cursor)) if cursor == "head"));
         assert!(matches!(events.next().await, Some(EventUpdate::Occurrence(event)) if event.event_id == "a"));
         assert!(matches!(events.next().await, Some(EventUpdate::Checkpoint(cursor)) if cursor == "cursor-a"));
         assert!(matches!(events.next().await, Some(EventUpdate::RecoverableError(_))));
-        assert!(matches!(events.next().await, Some(EventUpdate::Occurrence(event)) if event.event_id == "b"));
+        for id in ["a", "b"] {
+            assert!(matches!(events.next().await, Some(EventUpdate::Occurrence(event)) if event.event_id == id));
+        }
         assert!(matches!(events.next().await, Some(EventUpdate::Checkpoint(cursor)) if cursor == "cursor-b"));
-        assert!(matches!(events.next().await, Some(EventUpdate::Terminated { error: EventsError::Forbidden { reason: Some(reason) }, .. }) if reason == "revoked"));
+        assert!(matches!(events.next().await, Some(EventUpdate::Terminated(EventsError::Forbidden { reason: Some(reason) })) if reason == "revoked"));
         assert!(events.next().await.is_none());
         {
             let seen = ids.lock().unwrap();
@@ -549,15 +548,6 @@ async fn headers_validate_and_client_relists_after_schema_replacement() {
         assert_eq!(status, 400);
         assert_eq!(response["error"]["code"], -32020);
     }
-    let (status, response) = raw(
-        &url,
-        "events/poll",
-        json!({"name":name,"arguments":{"region":true}}),
-        &[("mcp-name", &name_header)],
-    )
-    .await;
-    assert_eq!(status, 200);
-    assert_eq!(response["error"]["code"], -32602);
     for method in [
         "events/poll",
         "events/stream",
@@ -643,18 +633,7 @@ async fn headers_validate_and_client_relists_after_schema_replacement() {
     assert_eq!(status, 200);
     assert_eq!(response["result"]["events"][0]["name"], name);
 
-    let transport = StreamableHttpClientTransport::from_config(
-        StreamableHttpClientTransportConfig::with_uri(url.clone()),
-    );
-    let client = ClientConfig::default()
-        .serve_with_lifecycle(
-            transport,
-            ClientLifecycleMode::Discover {
-                preferred_versions: vec![ProtocolVersion::V_2026_07_28],
-            },
-        )
-        .await
-        .unwrap();
+    let client = connect(url.clone()).await;
     let events = EventsClient::new(client.peer().clone());
     let mut params = PollParams::new(name);
     params.arguments = Some(args["arguments"].as_object().unwrap().clone());
@@ -713,7 +692,6 @@ async fn push_reopens_after_relisting_changed_routing_headers() {
                     Default::default(),
                 ),
                 |_| Ok(()),
-                |_| Ok(()),
             )
         };
         runtime
@@ -722,15 +700,7 @@ async fn push_reopens_after_relisting_changed_routing_headers() {
             })
             .unwrap();
         let (url, stop, task) = push_server(App(Some(runtime.clone()), false), None).await;
-        let client = ClientConfig::default()
-            .serve_with_lifecycle(
-                StreamableHttpClientTransport::from_uri(url),
-                ClientLifecycleMode::Discover {
-                    preferred_versions: vec![ProtocolVersion::V_2026_07_28],
-                },
-            )
-            .await
-            .unwrap();
+        let client = connect(url).await;
         let api = EventsClient::new(client.peer().clone());
         let arguments = json!({"region":"test"}).as_object().unwrap().clone();
         let mut stream = api
@@ -755,9 +725,9 @@ async fn push_reopens_after_relisting_changed_routing_headers() {
         runtime
             .replace(descriptor("source", "Updated"), Replacement::Breaking)
             .unwrap();
-        assert!(matches!(stream.next().await, Some(EventUpdate::Terminated {
-            error: EventsError::Unsupported { reason: Some(reason), .. }, ..
-        }) if reason == "schema_changed"));
+        assert!(matches!(stream.next().await, Some(EventUpdate::Terminated(
+            EventsError::Unsupported { reason: Some(reason), .. }
+        )) if reason == "schema_changed"));
         // The caller's cache must now know about the poll-only replacement.
         let mut options = SubscriptionOptions::default();
         options.mode = Some(DeliveryMode::Push);
@@ -774,7 +744,7 @@ async fn push_reopens_after_relisting_changed_routing_headers() {
 }
 
 #[tokio::test]
-async fn scripted_catalog_restarts_once_and_excludes_invalid_annotations() {
+async fn paginated_catalog_excludes_invalid_annotations() {
     use axum::{
         body::Bytes,
         extract::State,
@@ -785,9 +755,8 @@ async fn scripted_catalog_restarts_once_and_excludes_invalid_annotations() {
     #[derive(Default)]
     struct Observed {
         first: AtomicUsize,
-        stale: AtomicUsize,
+        next: AtomicUsize,
         poll: AtomicUsize,
-        allow_invalid: std::sync::atomic::AtomicBool,
     }
     async fn serve(
         State(observed): State<Arc<Observed>>,
@@ -811,23 +780,12 @@ async fn scripted_catalog_restarts_once_and_excludes_invalid_annotations() {
             }}),
             "events/list" => {
                 assert!(!headers.contains_key("mcp-name"));
-                if call["params"]["cursor"] == "stale" {
-                    observed.stale.fetch_add(1, Ordering::SeqCst);
-                    json!({"error":{"code":-32602,"message":"stale page"}})
+                if call["params"]["cursor"] == "next" {
+                    observed.next.fetch_add(1, Ordering::SeqCst);
+                    json!({"result":{"events":[annotated("valid","Count")]}})
                 } else {
-                    let first = observed.first.fetch_add(1, Ordering::SeqCst);
-                    let annotation = if observed.allow_invalid.load(Ordering::SeqCst) {
-                        "Count"
-                    } else {
-                        "not a token"
-                    };
-                    let mut result = json!({"resultType":"complete","events":[
-                        annotated("valid","Count"), annotated("invalid",annotation),
-                    ]});
-                    if first == 1 {
-                        result["nextCursor"] = json!("stale");
-                    }
-                    json!({"result":result})
+                    observed.first.fetch_add(1, Ordering::SeqCst);
+                    json!({"result":{"events":[annotated("invalid","not a token")],"nextCursor":"next"}})
                 }
             }
             "events/poll" => {
@@ -836,8 +794,8 @@ async fn scripted_catalog_restarts_once_and_excludes_invalid_annotations() {
                 assert_eq!(headers["mcp-param-count"], "42");
                 assert_eq!(headers["mcp-param-enabled"], "true");
                 match attempt {
-                    1 => json!({"error":{"code":-32020,"message":"routing changed"}}),
-                    3 => json!({"result":{"resultType":"complete","cursor":"past-event","events":[
+                    0 => json!({"error":{"code":-32020,"message":"routing changed"}}),
+                    2 => json!({"result":{"resultType":"complete","cursor":"past-event","events":[
                         {"eventId":"unparseable","name":"valid","timestamp":"20261124T120000Z","data":{}}
                     ]}}),
                     _ => json!({"result":{"resultType":"complete","events":[],"cursor":"head"}}),
@@ -862,51 +820,21 @@ async fn scripted_catalog_restarts_once_and_excludes_invalid_annotations() {
     let (url, stop, task) = serve_router(router, CancellationToken::new()).await;
     let client = connect(url).await;
     let events = EventsClient::new(client.peer().clone());
-    let page = events.list_page(None).await.unwrap();
-    assert_eq!(
-        page.events
-            .iter()
-            .map(|event| event.name.as_str())
-            .collect::<Vec<_>>(),
-        ["valid"]
-    );
-    let poll_missing = || async {
-        assert!(matches!(
-            events.poll(PollParams::new("invalid")).await,
-            Err(EventsError::NotFound { .. })
-        ));
-    };
-    poll_missing().await;
-    poll_missing().await;
-    assert_eq!(observed.first.load(Ordering::SeqCst), 3);
-    assert_eq!(observed.stale.load(Ordering::SeqCst), 1);
-    assert_eq!(observed.poll.load(Ordering::SeqCst), 0);
-    observed.allow_invalid.store(true, Ordering::SeqCst);
     assert!(matches!(
-        events.poll(PollParams::new("other")).await,
+        events.poll(PollParams::new("invalid")).await,
         Err(EventsError::NotFound { .. })
     ));
-    poll_missing().await; // Another miss refresh does not clear remembered names.
-    assert_eq!(observed.first.load(Ordering::SeqCst), 4);
-    observed.allow_invalid.store(false, Ordering::SeqCst);
+    assert_eq!(observed.poll.load(Ordering::SeqCst), 0);
     let mut params = PollParams::new("valid");
-    params.arguments = json!({"count":42.0,"enabled":true}).as_object().cloned();
+    params.arguments = json!({"count":42,"enabled":true}).as_object().cloned();
     events.poll(params.clone()).await.unwrap();
-    assert_eq!(observed.poll.load(Ordering::SeqCst), 1);
-    events.poll(params.clone()).await.unwrap();
-    assert_eq!(observed.poll.load(Ordering::SeqCst), 3);
-    assert_eq!(observed.first.load(Ordering::SeqCst), 5);
+    assert_eq!(observed.poll.load(Ordering::SeqCst), 2);
+    assert_eq!(observed.first.load(Ordering::SeqCst), 2);
+    assert_eq!(observed.next.load(Ordering::SeqCst), 2);
     assert!(matches!(
         events.poll(params).await,
         Err(EventsError::UnexpectedResponse)
     ));
-    poll_missing().await;
-    poll_missing().await;
-    assert_eq!(observed.first.load(Ordering::SeqCst), 6);
-    events.list_page(None).await.unwrap();
-    poll_missing().await;
-    poll_missing().await;
-    assert_eq!(observed.first.load(Ordering::SeqCst), 8);
     client.cancel().await.unwrap();
     stop.cancel();
     task.await.unwrap();
@@ -927,50 +855,6 @@ async fn connect(url: String) -> rmcp::service::RunningService<rmcp::RoleClient,
 }
 
 #[tokio::test]
-async fn http_catalog_notifications_and_legacy_initialize() {
-    let runtime = EventsServer::new();
-    let (url, stop, task) = server(App(Some(runtime.clone()), false)).await;
-    let response = reqwest::Client::new().post(&url)
-        .header("accept", "application/json, text/event-stream")
-        .header("mcp-protocol-version", "2025-11-25")
-        .json(&json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
-            "protocolVersion":"2025-11-25","clientInfo":{"name":"fixture","version":"1"},"capabilities":{}
-        }})).send().await.unwrap();
-    assert_eq!(response.status(), 200);
-    // Legacy sessions may stream the handshake in SSE rather than a JSON body.
-    let body = tokio::time::timeout(std::time::Duration::from_secs(5), response.text())
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(body.contains("protocolVersion"));
-    assert!(!body.contains("io.modelcontextprotocol/events"));
-
-    let client = connect(url).await;
-    let mut stream = client
-        .listen(SubscriptionFilter::builder().events_list_changed().build())
-        .await
-        .unwrap();
-    assert_eq!(stream.acknowledged().events_list_changed, Some(true));
-    runtime
-        .register_check(descriptor("after-ack", "Region"), |_, _, _| {
-            std::future::ready(Ok(CheckedBatch::new("head")))
-        })
-        .unwrap();
-    let notice = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
-    assert!(
-        matches!(notice, rmcp::model::ServerNotification::CustomNotification(value) if value.method == "notifications/events/list_changed")
-    );
-    stream.cancel().await.unwrap();
-    client.cancel().await.unwrap();
-    stop.cancel();
-    task.await.unwrap();
-}
-
-#[tokio::test]
 async fn numeric_and_boolean_mirrors_round_trip_through_tower() {
     let runtime = EventsServer::new();
     let schema = json!({"properties":{
@@ -986,7 +870,6 @@ async fn numeric_and_boolean_mirrors_round_trip_through_tower() {
             Default::default(),
         ),
         |_| Ok(()),
-        |_| Ok(()),
     );
     runtime
         .register_check(descriptor, |_, _, _| {
@@ -1000,7 +883,7 @@ async fn numeric_and_boolean_mirrors_round_trip_through_tower() {
         json!({"name":"counter","arguments":{"count":42,"enabled":true}}),
         &[
             ("mcp-name", "counter"),
-            ("mcp-param-count", "42.0"),
+            ("mcp-param-count", "42"),
             ("mcp-param-enabled", "true"),
         ],
     )
@@ -1013,7 +896,7 @@ async fn numeric_and_boolean_mirrors_round_trip_through_tower() {
         json!({"name":"counter","arguments":{"count":42,"enabled":true}}),
         &[
             ("mcp-name", "counter"),
-            ("mcp-param-count", "42.000000000000000001"),
+            ("mcp-param-count", "42.0"),
             ("mcp-param-enabled", "true"),
         ],
     )

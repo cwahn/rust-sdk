@@ -27,7 +27,6 @@ use egress::{Egress, Reason, callback_url, echo};
 use key::Key;
 
 const RPC_BUDGET: Duration = Duration::from_secs(15);
-const READ_BUDGET: Duration = Duration::from_secs(5);
 const DEFAULT_TTL_MS: u64 = 30 * 60 * 1_000;
 const MAX_TTL_MS: u64 = 60 * 60 * 1_000;
 const ROTATION_GRACE: Duration = Duration::from_secs(60);
@@ -68,7 +67,7 @@ struct Grant {
 struct GrantData {
     lease: Instant,
     refresh_before: DateTime<Utc>,
-    context: EventContext,
+    context: RequestContext<RoleServer>,
     context_revision: u64,
     permitted: Shared<Descriptor>,
     secret: WebhookSecret,
@@ -124,7 +123,10 @@ fn ttl(hint: WebhookTtl) -> Duration {
 }
 
 impl Dispatcher {
-    pub(super) fn principal(&self, context: &EventContext) -> Result<String, EventsError> {
+    pub(super) fn principal(
+        &self,
+        context: &RequestContext<RoleServer>,
+    ) -> Result<String, EventsError> {
         (self.principal)(&context.extensions)
             .filter(|principal| !principal.is_empty())
             .ok_or_else(forbidden)
@@ -208,7 +210,7 @@ impl GrantData {
 impl Grant {
     fn refresh(
         &self,
-        mut context: EventContext,
+        mut context: RequestContext<RoleServer>,
         secret: &WebhookSecret,
         duration: Duration,
     ) -> Option<WebhookSubscription> {
@@ -302,12 +304,11 @@ impl EventsServer {
         &self,
         method: &str,
         raw: Value,
-        context: EventContext,
+        context: RequestContext<RoleServer>,
         principal: String,
         registration: Option<Registration>,
     ) -> Result<CustomResult, EventsError> {
         let dispatcher = self.0.webhooks.as_ref().expect("checked configuration");
-        let ct = context.ct.clone();
         let work = async {
             if method == SUBSCRIBE {
                 let params: SubscribeParams = serde_json::from_value(raw)
@@ -354,12 +355,9 @@ impl EventsServer {
                 encode(crate::model::TaskAckResult::new())
             }
         };
-        tokio::select! {
-            biased;
-            () = ct.cancelled() => Err(source_error("webhook request cancelled")),
-            result = timeout(RPC_BUDGET, work) =>
-                result.map_err(|_| callback_error(Reason::Timeout))?,
-        }
+        timeout(RPC_BUDGET, work)
+            .await
+            .map_err(|_| callback_error(Reason::Timeout))?
     }
 
     async fn subscribe_webhook(
@@ -374,7 +372,7 @@ impl EventsServer {
             registration: (descriptor, registration, generation),
         } = call;
         if !descriptor.wire.delivery.contains(&DeliveryMode::Webhook) {
-            return Err(unsupported("webhook"));
+            return Err(unsupported(DeliveryMode::Webhook));
         }
         let url = callback_url(&params.delivery.url)?;
         let secret =
@@ -483,24 +481,19 @@ impl EventsServer {
 
 struct Subscribe {
     params: SubscribeParams,
-    context: EventContext,
+    context: RequestContext<RoleServer>,
     principal: String,
     registration: Registration,
 }
 
 async fn authorize(
     descriptor: &Descriptor,
-    context: &EventContext,
+    context: &RequestContext<RoleServer>,
     args: &JsonObject,
 ) -> Result<(), EventsError> {
     (descriptor.validate_arguments)(args)?;
     if let Some(authorize) = &descriptor.authorize {
-        timeout(
-            READ_BUDGET,
-            authorize(context.clone(), args.clone(), DeliveryMode::Webhook),
-        )
-        .await
-        .map_err(|_| source_error("webhook authorizer timed out"))??;
+        authorize(context.clone(), args.clone(), DeliveryMode::Webhook).await?;
     }
     Ok(())
 }
@@ -548,7 +541,7 @@ impl SourceRef {
             .delivery
             .contains(&DeliveryMode::Webhook)
         {
-            return Err(unsupported("webhook"));
+            return Err(unsupported(DeliveryMode::Webhook));
         }
         Ok(entry.descriptor.clone())
     }
@@ -565,7 +558,7 @@ impl SourceRef {
 
     async fn read(
         &self,
-        context: &EventContext,
+        context: &RequestContext<RoleServer>,
         query: &CheckQuery,
         descriptor: &Shared<Descriptor>,
     ) -> Result<PollResult, EventsError> {
@@ -580,22 +573,16 @@ impl SourceRef {
                     registry.epoch,
                     entry.registration,
                     entry.generation,
-                    entry.input_generation,
                     query,
-                )?),
+                )),
             }
         };
         match source {
-            Read::Emit(page) => page.finish(context, &self.args, descriptor, true),
+            Read::Emit(page) => Ok(page.finish(context, &self.args, descriptor, true)),
             Read::Check(check) => {
-                let batch = timeout(
-                    READ_BUDGET,
-                    check(context.clone(), self.args.clone(), query.clone()),
-                )
-                .await
-                .map_err(|_| source_error("event source check timed out"))??;
+                let batch = check(context.clone(), self.args.clone(), query.clone()).await?;
                 let (end, more, next) = (batch.end.clone(), batch.has_more, batch.next_poll_ms);
-                match checked_result(batch, query, &self.name, descriptor, true) {
+                match checked_result(batch, query, true) {
                     Err(EventsError::ResourceExhausted { limit, .. }) if limit == "pollBytes" => {
                         Ok(poll_result(
                             Vec::new(),
@@ -686,7 +673,11 @@ impl Worker {
             if !Shared::ptr_eq(&current, &permitted)
                 || (current.authorize.is_some() && next <= Instant::now())
             {
-                let authorization = authorize(&current, &context, &self.source.args).await;
+                let authorization = tokio::select! {
+                    () = changed => continue,
+                    () = grant_changed => continue,
+                    result = authorize(&current, &context, &self.source.args) => result,
+                };
                 let latest = match self.source.current() {
                     Ok(latest) => latest,
                     Err(error) => return error.into(),
@@ -835,6 +826,7 @@ impl Worker {
                     }
                     body = Some(encoded.into());
                 }
+                current.has_more &= query.cursor != cursor;
                 query.cursor.clone_from(&cursor);
                 sequence += 1;
                 let settled = body.is_none();
