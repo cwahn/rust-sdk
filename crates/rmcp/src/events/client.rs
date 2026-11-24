@@ -18,6 +18,8 @@ use crate::{
 };
 
 mod subscription;
+#[cfg(feature = "events-webhook-receiver")]
+mod webhook;
 pub use subscription::{EventSubscription, EventUpdate, SubscriptionOptions};
 
 /// A client for a peer that advertised the Events Beta via modern discovery.
@@ -143,10 +145,7 @@ impl EventsClient {
             .send_request(ClientRequest::CustomRequest(request))
             .await
             .map_err(from_service)?;
-        let ServerResult::CustomResult(result) = result else {
-            return Err(EventsError::UnexpectedResponse);
-        };
-        serde_json::from_value(result.0).map_err(|_| EventsError::UnexpectedResponse)
+        decode_result(result)
     }
 
     #[cfg(feature = "transport-streamable-http-client")]
@@ -236,6 +235,13 @@ fn from_service(error: ServiceError) -> EventsError {
         ServiceError::McpError(error) => EventsError::from(error),
         error => EventsError::Service(Box::new(error)),
     }
+}
+
+fn decode_result<T: DeserializeOwned>(result: ServerResult) -> Result<T, EventsError> {
+    let ServerResult::CustomResult(result) = result else {
+        return Err(EventsError::UnexpectedResponse);
+    };
+    serde_json::from_value(result.0).map_err(|_| EventsError::UnexpectedResponse)
 }
 
 fn poll_request(params: &impl Serialize) -> Result<CustomRequest, EventsError> {

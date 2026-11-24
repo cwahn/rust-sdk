@@ -1223,7 +1223,25 @@ macro_rules! custom_events_debug {
 }
 
 #[cfg(feature = "events")]
-custom_events_debug!(CustomRequest);
+impl std::fmt::Debug for CustomRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut debug = f.debug_struct("CustomRequest");
+        debug.field("method", &self.method);
+        // A raw JSON-RPC subscribe still carries the signing key in params.
+        #[cfg(feature = "events-webhook-receiver")]
+        if self.method == "events/subscribe" {
+            return debug.field("params", &"<redacted>").finish_non_exhaustive();
+        }
+        if self.method.starts_with("events/") || self.method.starts_with("notifications/events/") {
+            debug.field("params", &"<redacted>").finish_non_exhaustive()
+        } else {
+            debug
+                .field("params", &self.params)
+                .field("extensions", &self.extensions)
+                .finish()
+        }
+    }
+}
 #[cfg(feature = "events")]
 custom_events_debug!(CustomNotification);
 

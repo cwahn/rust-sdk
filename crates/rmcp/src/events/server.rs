@@ -37,6 +37,8 @@ mod emit;
 mod push;
 pub use emit::EmitHandle;
 use emit::{EmitPage, Ring};
+#[cfg(feature = "events-webhook")]
+pub use webhook::WebhookEgress;
 
 const MAX_SOURCES: usize = 128;
 const PAGE_SIZE: usize = 32;
@@ -60,6 +62,8 @@ hook!(Authorize = Fn(EventContext, JsonObject, DeliveryMode) -> HookFuture<Resul
 hook!(Matches = Fn(&EventContext, &EventOccurrence, &JsonObject) -> bool);
 hook!(Transform = Fn(&EventContext, &EventOccurrence, &JsonObject) -> Result<JsonObject, EventsError>);
 hook!(Check = Fn(EventContext, JsonObject, CheckQuery) -> HookFuture<Result<CheckedBatch, EventsError>>);
+#[cfg(feature = "events-webhook")]
+mod webhook;
 #[cfg(not(feature = "local"))]
 type HookFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 #[cfg(feature = "local")]
@@ -283,6 +287,8 @@ struct Registry {
     epoch: Uuid,
     state: Mutex<State>,
     changes: Notify,
+    #[cfg(feature = "events-webhook")]
+    webhooks: Option<Box<webhook::Dispatcher>>,
 }
 
 #[derive(Default)]
@@ -372,6 +378,8 @@ impl EventsServer {
             epoch: Uuid::new_v4(),
             state: Mutex::new(State::default()),
             changes: Notify::new(),
+            #[cfg(feature = "events-webhook")]
+            webhooks: None,
         }))
     }
 
@@ -401,7 +409,7 @@ impl EventsServer {
     }
 
     fn insert(&self, descriptor: Descriptor, source: Source) -> Result<u64, EventsError> {
-        validate_descriptor(&descriptor)?;
+        validate_enabled_descriptor(&descriptor, self.webhooks_enabled())?;
         descriptor.validate_source(&source)?;
         let mut state = self.0.state();
         if state.entries.contains_key(&descriptor.wire.name) {
@@ -411,9 +419,8 @@ impl EventsServer {
             return Err(limit("eventTypes", MAX_SOURCES));
         }
         let generation = state.revision + 1;
-        let emitted = (matches!(&source, Source::Emit(_))
-            && descriptor.wire.delivery.contains(&DeliveryMode::Push))
-        .then(|| Shared::new(Notify::new()));
+        let emitted = (matches!(&source, Source::Emit(_)) && self.notifies_emits(&descriptor))
+            .then(|| Shared::new(Notify::new()));
         state.entries.insert(
             descriptor.wire.name.clone(),
             Entry {
@@ -433,7 +440,7 @@ impl EventsServer {
     /// Application-owned check cursors remain under the source's control.
     /// Breaking replacement invalidates SDK emit cursors and clears history.
     pub fn replace(&self, descriptor: Descriptor, change: Replacement) -> Result<(), EventsError> {
-        validate_descriptor(&descriptor)?;
+        validate_enabled_descriptor(&descriptor, self.webhooks_enabled())?;
         let mut state = self.0.state();
         let generation = state.revision + 1;
         let entry = state
@@ -450,9 +457,7 @@ impl EventsServer {
                 *ring = Ring::default();
             }
         }
-        if descriptor.wire.delivery.contains(&DeliveryMode::Push)
-            && matches!(&entry.source, Source::Emit(_))
-        {
+        if self.notifies_emits(&descriptor) && matches!(&entry.source, Source::Emit(_)) {
             entry
                 .emitted
                 .get_or_insert_with(|| Shared::new(Notify::new()));
@@ -532,8 +537,10 @@ impl EventsServer {
             .take(PAGE_SIZE)
             .map(|entry| {
                 let mut wire = entry.descriptor.wire.clone();
-                wire.delivery
-                    .retain(|mode| matches!(mode, DeliveryMode::Poll | DeliveryMode::Push));
+                wire.delivery.retain(|mode| match mode {
+                    DeliveryMode::Webhook => self.webhooks_enabled(),
+                    _ => true,
+                });
                 wire
             })
             .collect();
@@ -584,6 +591,17 @@ impl EventsServer {
                 .as_ref()
                 .map(|(descriptor, _, _)| descriptor.wire.input_schema.as_ref()),
         )?;
+        #[cfg(feature = "events-webhook")]
+        if matches!(
+            method,
+            super::webhook::SUBSCRIBE | super::webhook::UNSUBSCRIBE
+        ) && let Some(dispatcher) = &self.0.webhooks
+        {
+            let principal = dispatcher.principal(&context)?;
+            return self
+                .dispatch_webhook(method, raw, context, principal, registered)
+                .await;
+        }
         let (descriptor, registration, generation) = registered.ok_or_else(not_found)?;
         if method == STREAM {
             let params =
@@ -603,6 +621,23 @@ impl EventsServer {
             self.poll(params, context, descriptor, registration, generation)
                 .await?,
         )
+    }
+
+    fn webhooks_enabled(&self) -> bool {
+        #[cfg(feature = "events-webhook")]
+        {
+            self.0.webhooks.is_some()
+        }
+        #[cfg(not(feature = "events-webhook"))]
+        {
+            false
+        }
+    }
+
+    fn notifies_emits(&self, descriptor: &Descriptor) -> bool {
+        let delivery = &descriptor.wire.delivery;
+        delivery.contains(&DeliveryMode::Push)
+            || (self.webhooks_enabled() && delivery.contains(&DeliveryMode::Webhook))
     }
 
     async fn poll(
@@ -686,7 +721,15 @@ fn ensure_current(entry: &Entry, registration: u64, generation: u64) -> Result<(
     }
 }
 
+#[cfg(test)]
 fn validate_descriptor(descriptor: &Descriptor) -> Result<(), EventsError> {
+    validate_enabled_descriptor(descriptor, false)
+}
+
+fn validate_enabled_descriptor(
+    descriptor: &Descriptor,
+    webhooks_enabled: bool,
+) -> Result<(), EventsError> {
     if descriptor.wire.name.is_empty() {
         return Err(invalid("empty event name"));
     }
@@ -695,16 +738,14 @@ fn validate_descriptor(descriptor: &Descriptor) -> Result<(), EventsError> {
             return Err(invalid("duplicate delivery mode"));
         }
     }
-    if !descriptor
-        .wire
-        .delivery
-        .iter()
-        .any(|mode| matches!(mode, DeliveryMode::Poll | DeliveryMode::Push))
-    {
+    if !descriptor.wire.delivery.iter().any(|mode| match mode {
+        DeliveryMode::Webhook => webhooks_enabled,
+        _ => true,
+    }) {
         return Err(EventsError::Unsupported {
             feature: "deliveryMode".into(),
             value: Some(json!(descriptor.wire.delivery)),
-            reason: Some("this source requires poll or push delivery".into()),
+            reason: Some("this source requires an enabled delivery mode".into()),
         });
     }
     crate::transport::common::mcp_headers::validate_param_header_annotations(

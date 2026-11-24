@@ -7,6 +7,10 @@
     not(feature = "local"),
 ))]
 
+#[cfg(feature = "events-webhook")]
+#[path = "common/events_webhook.rs"]
+mod webhook;
+
 use std::{
     sync::{
         Arc,

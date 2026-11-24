@@ -113,6 +113,9 @@ impl EventsClient {
         arguments: Option<JsonObject>,
         options: SubscriptionOptions,
     ) -> Result<EventSubscription, EventsError> {
+        if options.mode == Some(DeliveryMode::Webhook) {
+            return Err(unsupported(DeliveryMode::Webhook));
+        }
         self.require_advertisement()?;
         let name = name.into();
         let descriptor = self.descriptor_cached(&name, false).await?;
